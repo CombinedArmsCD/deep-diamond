@@ -6,9 +6,10 @@
 ;;   the terms of this license.
 ;;   You must not remove this notice, or any other, from this software.
 
-(ns uncomplicate.diamond.internal.dnnl.directed-test
+(ns ^{:author "Dragan Djuric"}
+    uncomplicate.diamond.internal.dnnl.directed-test
   (:require [midje.sweet :refer [facts throws => roughly]]
-            [uncomplicate.commons [core :refer [with-release]]]
+            [uncomplicate.commons [core :refer [with-release release]]]
             [uncomplicate.neanderthal
              [core :refer [transfer! native view-vctr view-ge cols]]
              [real :refer [entry! entry]]
@@ -16,10 +17,9 @@
              [random :refer [rand-uniform!]]
              [math :as math]]
             [uncomplicate.diamond
-             [tensor :refer [*diamond-factory* tensor connector transformer
-                             desc shape input output view-tz batcher]]
-             [dnn :refer [sum activation inner-product fully-connected
-                          network init! train cost train]]
+             [tensor :refer [*diamond-factory* tensor connector transformer desc shape input output
+                             view-tz batcher]]
+             [dnn :refer [sum activation inner-product fully-connected network init! train! cost]]
              [dnn-test :refer :all]]
             [uncomplicate.diamond.internal.protocols
              :refer [diff-weights forward backward weights bias]]
@@ -27,7 +27,7 @@
   (:import clojure.lang.ExceptionInfo))
 
 (facts "Inner product tests."
-       (with-release [fact (dnnl-factory)
+       (let [fact (dnnl-factory)
                       src-tz (tensor fact [1 3 2 1] :float :nchw)
                       dst-desc (desc [1 2] :float :nc)
                       ip (inner-product fact src-tz dst-desc)
@@ -45,7 +45,10 @@
          (transfer! [-0.1 0.8299999594688416] (view-vctr (output ip-train)))
          (backward ip-train) => ip-train
          (view-vctr (diff-weights ip-train)) => (fv 0.05 0 -0.020000001 -0.1 -0.030000001 0.07
-                                               -0.415 0.0 0.166 0.83 0.249 -0.581)))
+                                                    -0.415 0.0 0.166 0.83 0.249 -0.581)
+         (release ip-train)
+         (release ip-infer)
+         (release ip)))
 
 (facts "Inner product backprop step by step."
        (with-release [fact (dnnl-factory)

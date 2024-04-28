@@ -6,22 +6,24 @@
 ;;   the terms of this license.
 ;;   You must not remove this notice, or any other, from this software.
 
-(ns uncomplicate.diamond.internal.cudnn.tensor
+(ns ^{:author "Dragan Djuric"}
+    uncomplicate.diamond.internal.cudnn.tensor
   (:require [uncomplicate.commons
-             [core :refer [Releaseable release let-release with-release Info info Viewable view]]
+             [core :refer [Releaseable release let-release with-release Info info Viewable view
+                           bytesize]]
              [utils :refer [dragan-says-ex]]]
-            [uncomplicate.clojurecuda.core :refer [memcpy-host! mem-alloc]]
-            [uncomplicate.clojurecuda.internal.protocols :as cuda]
+            [uncomplicate.fluokitten.protocols :refer [Comonad extract]]
+            [uncomplicate.clojure-cpp :refer [pointer byte-pointer capacity position!]]
+            [uncomplicate.clojurecuda.core :refer [memcpy-to-host! cuda-malloc]]
             [uncomplicate.neanderthal
              [core :refer [transfer! dim vctr copy! native]]
-             [block :refer [entry-width buffer data-accessor count-entries create-data-source
-                            offset cast-prim]]
+             [block :refer [entry-width buffer data-accessor create-data-source cast-prim]]
              [cuda :refer [factory-by-type]]]
             [uncomplicate.neanderthal.internal.api
              :refer [flow equals-block compatible? set-all MemoryContext
                      EngineProvider Container DataAccessorProvider FactoryProvider
                      native-factory zero raw host factory fits? DenseContainer view-vctr]]
-            [uncomplicate.neanderthal.internal.device.cublock
+            [uncomplicate.neanderthal.internal.cpp.cuda.structures
              :refer [cu-block-vector set-vector! get-vector!]]
             [uncomplicate.diamond.tensor
              :as diamond
@@ -31,15 +33,15 @@
              [protocols
               :refer [TensorFactory DiamondFactoryProvider create-tensor create-tensor-desc
                       diamond-factory neanderthal-factory tensor-engine native-diamond-factory
-                      Offset DiffTransfer diff-input diff-output BatchDescriptor
+                      Offset offset DiffTransfer diff-input diff-output BatchDescriptor
                       batch-index]]
              [utils :refer [check-contiguous default-strides]]]
             [uncomplicate.diamond.internal.dnnl
-             [tensor :as dnnl-tensor]
-             [protocols :as dnnl :refer [data]]
-             [core :as dnnl-core :refer [memory-desc]]]
+             [protocols :as dnnl]
+             [core :as dnnl-core :refer [memory-desc]]
+             [tensor :refer []]]
             [uncomplicate.diamond.internal.cudnn
-             [core :refer [tensor-descriptor equal-desc? size dims strides transform-tensor]]
+             [core :refer [tensor-descriptor equal-desc? dims strides transform-tensor]]
              [protocols :refer [DescProvider desc handle]]
              [constants :refer [cudnn-format]]])
   (:import [clojure.lang IFn ExceptionInfo AFn]
@@ -58,8 +60,7 @@
 (defn ^:private not-available []
   (throw (UnsupportedOperationException. "Not available in CUDA. Please use a host instance.")))
 
-(declare ->CUDnnTensor cudnn-transformer cudnn-tensor ->CUDnnShuffler
-         cudnn-batcher cudnn-tensor-desc)
+(declare ->CUDnnTensor cudnn-transformer cudnn-tensor ->CUDnnShuffler cudnn-batcher cudnn-tensor-desc)
 
 (defn cudnn-shape-padding [shape]
   (into shape (repeat (- 4 (count shape)) 1)))
@@ -96,7 +97,7 @@
   (data-type [this]
     (.data-type this))
   (layout [this]
-    (.strides this))
+    (.layout this))
   ConnectorCreator
   (connector [in-desc out]
     (if (equal-desc? in-desc (input out))
@@ -110,11 +111,12 @@
 
 (defmethod print-method CUTensorDescriptor
   [^CUTensorDescriptor d ^java.io.Writer w]
-  (.write w (pr-str {:shape (.dims d) :data-type (.data-type d) :layout (.strides d)})))
+  (.write w (pr-str {:shape (.dims d) :data-type (.data-type d) :layout (.layout d)})))
 
 (defn cudnn-tensor-desc [shape dtype format]
   (let [format (or format (default-strides shape))]
-    (if (or (cudnn-format format) (and (sequential? format) (<= 4 (count format))))
+    (if (or (cudnn-format format)
+            (and (sequential? format) (<= 4 (count format)) (= (count format) (count shape))))
       (tensor-descriptor shape dtype format)
       (with-release [md (memory-desc shape dtype format)]
         (let [padding-4 (repeat (- 4 (count shape)) 1)]
@@ -127,7 +129,7 @@
   (data-type [this]
     (.data-type this))
   (layout [this]
-    (.format this))
+    (.layout this))
   ConnectorCreator
   (connector [in-desc out]
     (if (equal-desc? in-desc (input out))
@@ -141,8 +143,7 @@
 
 (defmethod print-method CUFilterDescriptor
   [^CUFilterDescriptor d ^java.io.Writer w]
-  (.write w (pr-str {:shape (.dims d) :data-type (.data-type d)
-                     :format (.format d)})))
+  (.write w (pr-str {:shape (.dims d) :data-type (.data-type d) :format (.layout d)})))
 
 ;; =================== Transformer ==============================================
 
@@ -180,10 +181,8 @@
     out-tz)
   (invoke [_ cudnn-hdl2]
     (transform-tensor cudnn-hdl2
-                      (cast-prim in-da 1.0)
-                      in-tz (buffer in-tz) (* (offset in-tz) (entry-width in-da))
-                      (cast-prim out-da 0.0)
-                      out-tz (buffer out-tz) (* (offset out-tz) (entry-width out-da)))
+                      (cast-prim in-da 1.0) in-tz (byte-pointer (buffer in-tz))
+                      (cast-prim out-da 0.0) out-tz (byte-pointer (buffer out-tz)) )
     out-tz)
   (applyTo [this xs]
     (AFn/applyToHelper this xs))
@@ -199,8 +198,7 @@
 ;; =================== Batcher ==================================================
 
 (deftype CUDnnBatcher [cudnn-hdl src-sub dst-sub src-tz dst-tz ^long mb-size
-                       ^long src-cnt ^long src-stride-n ^long src-entry-width
-                       ^long dst-cnt ^long dst-stride-n ^long dst-entry-width]
+                       ^long src-cnt ^long src-stride-n ^long dst-cnt ^long dst-stride-n]
   Releaseable
   (release [_]
     (release src-tz)
@@ -239,11 +237,13 @@
     (let [src-n (long src-n)
           dst-n (long dst-n)]
       (if (and (<= 0 src-n (- src-cnt mb-size)) (<= 0 dst-n (- dst-cnt mb-size)))
-        (transform-tensor cudnn-hdl2
-                          (cast-prim (data-accessor src-sub) 1.0) src-sub (buffer src-sub)
-                          (+ (offset src-sub) (* src-entry-width src-stride-n src-n))
-                          (cast-prim (data-accessor dst-sub) 0.0) dst-sub (buffer dst-sub)
-                          (+ (offset dst-sub) (* dst-entry-width dst-stride-n dst-n)))
+        (do (offset src-sub (* src-stride-n src-n))
+            (offset dst-sub (* dst-stride-n dst-n))
+            (transform-tensor cudnn-hdl2
+                             (cast-prim (data-accessor src-sub) 1.0) src-sub
+                             (byte-pointer (buffer src-sub))
+                             (cast-prim (data-accessor dst-sub) 0.0) dst-sub
+                             (byte-pointer (buffer dst-sub))))
         (dragan-says-ex "Requested subtensor is outside of bounds."
                         {:src-index src-n :src-cnt src-cnt :dst-index dst-n :dst-cnt dst-cnt
                          :mb-size mb-size})))
@@ -258,14 +258,12 @@
 
 (defn cudnn-batcher [cudnn-hdl src-tz dst-tz mb-size]
   (let [mb-size (max 1 (long mb-size))]
-    (let-release [src-sub (view-tz src-tz mb-size)
-                  dst-sub (view-tz dst-tz mb-size)]
+    (let-release [src-sub (view (view-tz src-tz mb-size))
+                  dst-sub (view (view-tz dst-tz mb-size))]
       (->CUDnnBatcher cudnn-hdl src-sub dst-sub
                       src-tz dst-tz mb-size
                       ((dims src-tz) (batch-index src-tz)) ((strides src-sub) (batch-index src-tz))
-                      (entry-width (data-accessor src-sub))
-                      ((dims dst-tz) (batch-index dst-tz)) ((strides dst-sub) (batch-index dst-tz))
-                      (entry-width (data-accessor dst-sub))))))
+                      ((dims dst-tz) (batch-index dst-tz)) ((strides dst-sub) (batch-index dst-tz))))))
 
 (deftype CUDnnShuffler [cudnn-hdl batcher batch-size mb-size]
   Releaseable
@@ -317,8 +315,7 @@
 
 ;; ================================ Tensor ======================================
 
-(deftype CUDnnTensor [diamond-fact eng vect-view master buf ^long ofst
-                      ^CUTensorDescriptor cu-desc ^long n-index]
+(deftype CUDnnTensor [diamond-fact eng vect-buf ^CUTensorDescriptor cu-desc ^long n-index]
   Object
   (hashCode [x]
     (-> (hash :CUDnnTensor) (hash-combine (hash cu-desc))))
@@ -326,19 +323,18 @@
     (or (identical? x y)
         (and (instance? CUDnnTensor y) (equal-desc? cu-desc (desc y))
              (.isContiguous x) (.isContiguous ^CUDnnTensor y)
-             (= (view-vctr x) (view-vctr y)))))
+             (= vect-buf (.-vect-buf ^CUDnnTensor y)))))
   (toString [this]
     (pr-str {:shape (.dims cu-desc) :data-type (.data-type cu-desc)
-             :layout (.strides cu-desc)}))
+             :layout (.layout cu-desc)}))
   Info
   (info [x]
     {:data-type (.data-type cu-desc)
      :class (class x)
      :device :cuda
      :shape (.dims cu-desc)
-     :offset ofst
-     :strides (.strides cu-desc)
-     :master master
+     :strides (.layout cu-desc)
+     :master (info vect-buf :master)
      :engine eng})
   (info [x info-type]
     (case info-type
@@ -346,17 +342,18 @@
       :class (class x)
       :device :cuda
       :shape (.dims cu-desc)
-      :offset ofst
-      :strides (.strides cu-desc)
-      :master master
+      :strides (.layout cu-desc)
+      :master (info vect-buf :master)
       :engine eng
       nil))
   Releaseable
   (release [_]
-    (when master
-      (release buf))
+    (release vect-buf)
     (release cu-desc)
     true)
+  Comonad
+  (extract [_]
+    (extract vect-buf))
   EngineProvider
   (engine [_]
     eng)
@@ -367,12 +364,12 @@
     (native-diamond-factory diamond-fact))
   FactoryProvider
   (factory [_]
-    (factory vect-view))
+    (factory vect-buf))
   (native-factory [_]
-    (native-factory vect-view))
+    (native-factory vect-buf))
   DataAccessorProvider
   (data-accessor [_]
-    (data-accessor vect-view))
+    (data-accessor vect-buf))
   Container
   (raw [x]
     (raw x diamond-fact))
@@ -386,13 +383,13 @@
       (create-tensor df (create-tensor-desc df cu-desc) n-index true)))
   (host [x]
     (let-release [res (raw x (native-diamond-factory diamond-fact))]
-      (get-vector! vect-view (view-vctr res))
+      (get-vector! vect-buf (view-vctr res))
       res))
   (native [x]
     (host x))
   MemoryContext
   (compatible? [_ y]
-    (compatible? (factory vect-view) (factory y)))
+    (compatible? (factory vect-buf) (factory y)))
   (fits? [_ y]
     (= (.dims cu-desc) (cudnn-shape-padding (shape y))))
   (device [_]
@@ -402,19 +399,18 @@
     (apply * (.dims cu-desc)))
   Block
   (buffer [_]
-    buf)
+    (buffer vect-buf))
   (offset [_]
-    ofst)
+    0)
   (stride [_]
     (dragan-says-ex "Tensors do not have a single stride. You're doing something wrong."))
   (isContiguous [_]
-    (= (size cu-desc)
-       (apply * (entry-width (data-accessor vect-view)) (.dims cu-desc))))
+    (= (dim vect-buf) (apply * (.dims cu-desc))))
   Changeable
-  (setBoxed [x val]
-    (set-all eng val x)
+  (setBoxed [x v]
+    (set-all eng v x)
     x)
-  (setBoxed [x i val]
+  (setBoxed [_ _ _]
     (dragan-says-ex INEFFICIENT_OPERATION_MSG))
   (alter [_ _]
     (dragan-says-ex INEFFICIENT_OPERATION_MSG))
@@ -447,16 +443,16 @@
   (data-type [_]
     (.data-type cu-desc))
   (layout [_]
-    (.strides cu-desc))
+    (.layout cu-desc))
   BatchDescriptor
   (batch-index [_]
     n-index)
   Viewable
   (view [_]
-    (->CUDnnTensor diamond-fact eng vect-view false buf ofst (view cu-desc) n-index))
+    (->CUDnnTensor diamond-fact eng (view vect-buf) (view cu-desc) n-index))
   DenseContainer
   (view-vctr [_]
-    vect-view)
+    vect-buf)
   TensorContainer
   (view-tz [this]
     this)
@@ -464,16 +460,18 @@
     (let-release [sub-desc (if (number? sub)
                              (cudnn-tensor-desc (assoc (dims cu-desc) n-index sub)
                                                 (.data-type cu-desc)
-                                                (.strides cu-desc))
+                                                (.layout cu-desc))
                              (cudnn-tensor-desc (shape sub)
                                                 (or (data-type sub) (.data-type cu-desc))
-                                                (or (layout sub) (.strides cu-desc))))]
-      (cudnn-tensor diamond-fact false buf ofst sub-desc n-index)))
+                                                (or (layout sub) (.layout cu-desc))))]
+      (cudnn-tensor diamond-fact false (pointer (buffer vect-buf) 0) sub-desc n-index)))
   Offset
-  (offset [this new-ofst]
-    (cudnn-tensor diamond-fact false buf
-                  (+ ofst (long new-ofst))
-                  (view cu-desc) n-index))
+  (offset [this ofst]
+    (if (<= 0 (long ofst) (capacity (buffer vect-buf)))
+      (position! (buffer vect-buf) ofst)
+      (dragan-says-ex "There isn't enough capacity in the underlying buffer for this offset."
+                      {:requested ofst :available (capacity (buffer vect-buf))}))
+    this)
   ConnectorCreator
   (connector [in-tz out-desc]
     (if (equal-desc? cu-desc out-desc)
@@ -482,23 +480,23 @@
         (cudnn-transformer (handle diamond-fact) (view in-tz) out-tz)))))
 
 (defn cudnn-tensor
-  ([diamond-fact master buf ofst tdesc n-index]
+  ([diamond-fact master buf tdesc n-index]
    (let [tdesc (desc tdesc)
          neand-fact (neanderthal-factory diamond-fact (data-type tdesc))
          tz-cnt (apply * (dims tdesc))]
-     (if (<= 0 (size tdesc) (- (long (cuda/size buf)) (long ofst)))
-       (let-release [vect-view (cu-block-vector neand-fact false buf tz-cnt ofst 1)]
+     (if (<= 0 (bytesize tdesc) (bytesize buf))
+       (let-release [vect-buf (cu-block-vector neand-fact master buf tz-cnt 1)]
          (->CUDnnTensor diamond-fact
                         (tensor-engine diamond-fact (data-type tdesc))
-                        vect-view master buf ofst tdesc n-index))
+                        vect-buf tdesc n-index))
        (throw (ex-info "Insufficient buffer size."
-                       {:size (size tdesc) :buffer-size (cuda/size buf)})))))
-  ([diamond-fact master buf ofst tdesc]
-   (cudnn-tensor diamond-fact master buf ofst tdesc 0))
+                       {:desc-size (bytesize tdesc) :buffer-size (bytesize buf)})))))
+  ([diamond-fact master buf tdesc]
+   (cudnn-tensor diamond-fact master buf tdesc 0))
   ([diamond-fact tdesc n-index]
    (let [tdesc (desc tdesc)]
-     (let-release [buf (mem-alloc (max 1 (size tdesc)))]
-       (cudnn-tensor diamond-fact true buf 0 tdesc n-index))))
+     (let-release [buf (cuda-malloc (max 1 (bytesize tdesc)) (data-type tdesc))]
+       (cudnn-tensor diamond-fact true buf tdesc n-index))))
   ([diamond-fact tdesc]
    (cudnn-tensor diamond-fact tdesc 0)))
 
@@ -524,7 +522,6 @@
                      dnnl-view (view-tz src (diamond/desc (cudnn-shape-padding (shape src))
                                                           (data-type src)
                                                           (cudnn-shape-padding (layout src))))]
-        (dnnl-core/offset! (buffer dnnl-view) (dnnl-core/offset (buffer src)))
         (transfer! dnnl-view dnnl-mid)
         (set-vector! (view-vctr dnnl-mid) (view-vctr dest))))
     (dragan-says-ex DOES_NOT_FIT_MSG
@@ -543,7 +540,6 @@
                      dnnl-view (view-tz dest (diamond/desc (cudnn-shape-padding (shape dest))
                                                            (data-type dest)
                                                            (cudnn-shape-padding (layout dest))))]
-        (dnnl-core/offset! (buffer dnnl-view) (dnnl-core/offset (buffer dest)))
         (get-vector! (view-vctr src) (view-vctr dnnl-mid))
         (transfer! dnnl-mid dnnl-view)))
     (dragan-says-ex DOES_NOT_FIT_MSG

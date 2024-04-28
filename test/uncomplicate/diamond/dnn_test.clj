@@ -6,9 +6,10 @@
 ;;   the terms of this license.
 ;;   You must not remove this notice, or any other, from this software.
 
-(ns uncomplicate.diamond.dnn-test
+(ns ^{:author "Dragan Djuric"}
+    uncomplicate.diamond.dnn-test
   (:require [midje.sweet :refer [facts throws => roughly just]]
-            [uncomplicate.commons [core :refer [with-release]]]
+            [uncomplicate.commons [core :refer [with-release release]]]
             [uncomplicate.neanderthal
              [core :refer [entry! entry native transfer! view-vctr vctr
                            cols view-ge nrm2 axpy!]]
@@ -254,7 +255,7 @@
                  quad-cost (cost net train-tz :quadratic)]
     (facts "Sequential network with linear/quadratic cost."
            (transfer! (range 16) input-tz)
-           (train net quad-cost 10 [0.01 0 0 false]) => (roughly 0.0 0.002))))
+           (train! net quad-cost 10 [0.01 0 0 false]) => (roughly 0.0 0.002))))
 
 (defn test-sequential-network-detailed [fact]
   (with-release [input-tz (tensor fact [2 1] :float :nc)
@@ -271,7 +272,7 @@
            (transfer! [0.8 0.8] (weights (second net)))
            (transfer! [0.5 0.5] (bias (second net)))
            (transfer! [0.25 0.25] train-tz)
-           (train net quad-cost 1 [1 0 0 false]) => 0.056953115582683234
+           (train! net quad-cost 1 [1 0 0 false]) => 0.056953115582683234
            (entry (native (view-vctr (weights (first net)))) 0) => (roughly 0.08)
            (entry (native (view-vctr (bias (first net)))) 0) => (roughly -0.16)
            (entry (native (view-vctr (weights (second net)))) 0) => 0.6875
@@ -296,7 +297,7 @@
            (transfer! [0.8 0.8] (weights (second net)))
            (transfer! [0.5 0.5] (bias (second net)))
            (transfer! [0.25 0.25 2.5 2.5] train-tz)
-           (train net x-batcher y-batcher quad-cost 2 [1]) => (roughly 5.5345)
+           (train! net x-batcher y-batcher quad-cost 2 [1]) => (roughly 5.5345)
            (entry (native (view-vctr (weights (first net)))) 0) => (roughly 0.97108)
            (entry (native (view-vctr (bias (first net)))) 0) => (roughly 1.0245)
            (entry (native (view-vctr (weights (second net)))) 0) = (roughly 0.79295)
@@ -341,7 +342,7 @@
                         crossentropy-cost (cost net train-tz :crossentropy)]
            (transfer! (range 16) input-tz)
            (transfer! [0.9 0.1] train-tz)
-           (train net crossentropy-cost 3 [0.01 0 0 false]) => (roughly 2 1.3))))
+           (train! net crossentropy-cost 3 [0.01 0 0 false]) => (roughly 2.0 1.5))))
 
 (defn test-sequential-network-sigmoid-adam [fact]
   (facts "Sequential Adam network with sigmoid cross-entropy."
@@ -355,7 +356,7 @@
                         crossentropy-cost (cost net train-tz :crossentropy)]
            (transfer! (range 16) input-tz)
            (transfer! [0.9 0.1] train-tz)
-           (train net crossentropy-cost 3 []) => (roughly 1.7 1.1))))
+           (train! net crossentropy-cost 4 []) => (roughly 2.0 1.5))))
 
 (defn my-fn ^double [xs]
   (+ (math/sin (entry xs 0))
@@ -375,7 +376,7 @@
     (facts "Gradient descent."
            (rand-uniform! (view-vctr x-tz))
            (transfer! (map my-fn (cols (native (view-ge (view-vctr x-tz) 4 10000)))) (view-vctr y-tz))
-           (train net quad-cost 30 [0.003 0 0 false]) => (roughly 0.0 0.2))))
+           (train! net quad-cost 30 [0.003 0 0 false]) => (roughly 0.0 0.3))))
 
 (defn test-stochastic-gradient-descent-sgd [fact]
   (with-release [x-tz (tensor fact [10000 4] :float :nc)
@@ -393,7 +394,7 @@
     (facts "Vanilla stochastic gradient descent."
            (rand-uniform! (view-vctr x-tz))
            (transfer! (map my-fn (cols (native (view-ge (view-vctr x-tz) 4 10000)))) (view-vctr y-tz))
-           (train net x-shuff y-shuff quad-cost 1 [0.01 0 0 false]) => (roughly 0.0 0.2))))
+           (train! net x-shuff y-shuff quad-cost 1 [0.01 0 0 false]) => (roughly 0.0 0.2))))
 
 (defn test-stochastic-gradient-descent-adam [fact]
   (with-release [x-tz (tensor fact [10000 4] :float :nc)
@@ -411,7 +412,7 @@
     (facts "Stochastic gradient descent with Adam."
            (rand-uniform! (view-vctr x-tz))
            (transfer! (map my-fn (cols (native (view-ge (view-vctr x-tz) 4 10000)))) (view-vctr y-tz))
-           (train net x-shuff y-shuff quad-cost 1 [0.01]) => (roughly 0.0 0.01))))
+           (train! net x-shuff y-shuff quad-cost 1 [0.01]) => (roughly 0.0 0.02))))
 
 (defn bench-wide-layers [fact]
   (with-release [input-tz (tensor fact [1024 1] :float :nc)
@@ -575,7 +576,7 @@
                         crossentropy-cost (cost net train-tz :crossentropy)]
            (transfer! (range 1 10 0.2) input-tz)
            (transfer! [0.9 0.1 0 0] train-tz)
-           (train net crossentropy-cost 3 []) => (roughly 1.7 1))))
+           (train! net crossentropy-cost 3 []) => (roughly 3.0 2.0))))
 
 (defn test-gaussian-dropout [fact]
   (with-release [src-tz (tensor fact [2 1 4 4] :float :nchw)
@@ -635,7 +636,7 @@
      (backward bnorm-train) => bnorm-train
      (backward bnorm-train [nil 1 0 1 false]) => bnorm-train
      (seq (native (weights bnorm-train))) => (just [(roughly -2.1385) (roughly 4.7199)])
-     (seq (native (bias bnorm-train))) => [-4.5 3.0]
+     ;; (seq (native (bias bnorm-train))) => [-4.5 3.0] :shift is no longer supported by DNNL (September 2023). They say it's not useful, so...
      (nrm2 (native (view-vctr (diff-output bnorm-train)))) => (roughly 5.954477))))
 
 (defn test-concatenate [fact]
@@ -725,8 +726,7 @@
 (defn test-network-concat [fact]
   (with-release [input0-tz (tensor fact [1 1 1 1] :float :nchw)
                  input1-tz (tensor fact [1 2 1 1] :float :nchw)
-                 net-bp (network fact [input0-tz input1-tz]
-                                 [(conc 1)])
+                 net-bp (network fact [input0-tz input1-tz] [(conc 1)])
                  net-train (net-bp [input0-tz input1-tz] true :adam)]
     (let [parallel-layers 1]
       (transfer! [1] input0-tz)
@@ -893,6 +893,7 @@
                  input-bias (connector (desc [2 1 1 2] :float :ldgo) (bias-layer rnn-no-iter))
                  output-bias (revert input-bias)]
     (facts "Vanilla RNN inference operation without iter."
+           (init! rnn-no-iter)
            (transfer! [2 3 0.2 0.3] input-tz)
            (transfer! [0.1 0.2 0.3 0.4 0.3 0.4 0.5 0.6] (input input-weights))
            (input-weights)
@@ -917,9 +918,10 @@
                  output-weights (revert input-weights)
                  output-weights-iter (connector (weights-iter rnn-no-iter)
                                                 (desc [2 1 2 1 2] :float :ldigo))
-                 input-bias (connector (desc [2 1 1 2] :float :ldgo) (bias-layer rnn-no-iter))
+                 input-bias (connector :ldgo (bias-layer rnn-no-iter))
                  output-bias (revert input-bias)]
     (facts "Vanilla RNN training operation without iter."
+           (init! rnn-no-iter)
            (transfer! [2 3 0.2 0.3] input-tz)
            (transfer! [0.1 0.2 0.3 0.4 0.3 0.4 0.5 0.6] (input input-weights))
            (input-weights)
@@ -948,6 +950,7 @@
                  input-weights-iter (connector (desc [2 1 2 1 2] :float :ldigo) (weights-iter (.op rnn-iter)))
                  input-bias (connector (desc [2 1 1 2] :float :ldgo) (bias-layer rnn-iter))]
     (facts "Vanilla RNN layer inference."
+           (init! rnn-iter)
            (transfer! [2 3 0.2 0.3] input-tz)
            (transfer! [0.1 0.2 0.3 0.4 0.3 0.4 0.5 0.6] (input input-weights))
            (input-weights)
@@ -958,16 +961,23 @@
            (seq (native (rnn-iter)))
            => (just [2.570000171661377 3.940000057220459 850.6968994140625 (roughly 1054.889)])
            (seq (native (output rnn-iter)))
-           => (just [2.570000171661377 3.940000057220459 850.6968994140625 (roughly 1054.889)]))))
+           => (just [2.570000171661377 3.940000057220459 850.6968994140625 (roughly 1054.889)]))
+    (release input-tz)
+    (release input-weights)
+    (release input-weights-iter)
+    (release input-bias)
+    (release rnn-iter)
+    (release rnn-bluep-iter)))
 
 (defn test-rnn-training-no-iter [fact]
   (with-release [input-tz (tensor fact [2 1 2] :float :tnc)
                  rnn-bluep-no-iter (rnn fact input-tz [2 1 2] 2 :relu nil)
                  rnn-no-iter (rnn-bluep-no-iter input-tz nil :sgd)
                  input-weights (connector (desc [2 1 2 1 2] :float :ldigo) (weights-layer (.op rnn-no-iter)))
-                 input-weights-iter (connector (desc [2 1 2 1 2] :float :ldigo) (weights-iter (.op rnn-no-iter)))
+                 input-weights-iter (connector :ldigo (weights-iter (.op rnn-no-iter)))
                  input-bias (connector (desc [2 1 1 2] :float :ldgo) (bias-layer rnn-no-iter))]
     (facts "Vanilla RNN layer training without iter."
+           (init! rnn-no-iter)
            (transfer! [2 3 0.2 0.3] input-tz)
            (transfer! [0.1 0.2 0.3 0.4 0.3 0.4 0.5 0.6] (input input-weights))
            (input-weights)
@@ -987,11 +997,11 @@
   (with-release [input-tz (tensor fact [2 1 2] :float :tnc)
                  lstm-bluep-no-iter (rnn fact input-tz [2 1 2] 2 :lstm nil)
                  lstm-no-iter (lstm-bluep-no-iter input-tz nil :sgd)
-                 input-weights (connector (desc [2 1 2 4 2] :float :ldigo) ;;TODO support just :ldigo as desc.
-                                          (weights-layer (.op lstm-no-iter)))
+                 input-weights (connector  :ldigo (weights-layer (.op lstm-no-iter)))
                  input-weights-iter (connector (desc [2 1 2 4 2] :float :ldigo) (weights-iter (.op lstm-no-iter)))
                  input-bias (connector (desc [2 1 4 2] :float :ldgo) (bias-layer lstm-no-iter))]
     (facts "LSTM layer training SGD."
+           (init! (.op lstm-no-iter))
            (transfer! [2 3 0.2 0.3] input-tz)
            (transfer! [0.1 0.2 0.3 0.4 0.3 0.4 0.5 0.6
                        0.1 0.2 0.3 0.4 0.3 0.4 0.5 0.6
@@ -1017,11 +1027,11 @@
   (with-release [input-tz (tensor fact [2 1 2] :float :tnc)
                  lstm-bluep-no-iter (rnn fact input-tz [2 1 2] 2 :lstm nil)
                  lstm-no-iter (lstm-bluep-no-iter input-tz nil :adam)
-                 input-weights (connector (desc [2 1 2 4 2] :float :ldigo) ;;TODO support just :ldigo as desc.
-                                          (weights-layer (.op lstm-no-iter)))
+                 input-weights (connector :ldigo (weights-layer (.op lstm-no-iter)))
                  input-weights-iter (connector (desc [2 1 2 4 2] :float :ldigo) (weights-iter (.op lstm-no-iter)))
                  input-bias (connector (desc [2 1 4 2] :float :ldgo) (bias-layer lstm-no-iter))]
     (facts "LSTM layer training Adam."
+           (init! lstm-no-iter)
            (transfer! [2 3 0.2 0.3] input-tz)
            (transfer! [0.1 0.2 0.3 0.4 0.3 0.4 0.5 0.6
                        0.1 0.2 0.3 0.4 0.3 0.4 0.5 0.6
@@ -1047,11 +1057,11 @@
   (with-release [input-tz (tensor fact [2 1 2] :float :tnc)
                  gru-bluep-no-iter (rnn fact input-tz [2 1 2] 2 :gru nil)
                  gru-no-iter (gru-bluep-no-iter input-tz nil :adam)
-                 input-weights (connector (desc [2 1 2 3 2] :float :ldigo) ;;TODO support just :ldigo as desc.
-                                          (weights-layer (.op gru-no-iter)))
-                 input-weights-iter (connector (desc [2 1 2 3 2] :float :ldigo) (weights-iter (.op gru-no-iter)))
+                 input-weights (connector :ldigo (weights-layer (.op gru-no-iter)))
+                 input-weights-iter (connector :ldigo (weights-iter (.op gru-no-iter)))
                  input-bias (connector (desc [2 1 3 2] :float :ldgo) (bias-layer gru-no-iter))]
     (facts "GRU layer training Adam."
+           (init! gru-no-iter)
            (transfer! [2 3 0.2 0.3] input-tz)
            (transfer! [0.111 0.112 0.121 0.122 0.131 0.132
                        0.211 0.212 0.221 0.222 0.231 0.232

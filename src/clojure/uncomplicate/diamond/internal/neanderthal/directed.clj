@@ -13,8 +13,8 @@
             [uncomplicate.fluokitten.core :refer [fmap]]
             [uncomplicate.neanderthal
              [core :refer [rk! mm! mv! trans axpy! axpby! view-vctr view-ge mrows
-                           ncols vctr zero dim transfer! raw]]
-             [real :refer [entry! nrm2 asum]]
+                           ncols vctr zero dim transfer! raw entry!]]
+             [real :refer [nrm2 asum]]
              [math :refer [sqr pow sqrt]]
              [vect-math :refer [linear-frac! linear-frac mul! log! log sqrt! sqr!]]
              [random :refer [rand-normal! rng-state]]
@@ -59,6 +59,9 @@
     diff)
   (diff-output [_]
     diff)
+  Initializable
+  (init [this _]
+    this)
   IFn
   (invoke [_]
     data)
@@ -144,6 +147,11 @@
   ParametersSeq
   (parameters [_]
     [weights-tz bias-tz])
+  Initializable
+  (init [this init-fn]
+    (init-fn weights-tz)
+    (init-fn bias-tz)
+    this)
   IFn
   (invoke [_]
     (src-conn)
@@ -204,6 +212,11 @@
   DiffParameters
   (diff-weights [_]
     diff-weights-tz)
+  Initializable
+  (init [this init-fn]
+    (init-fn weights-tz)
+    (init-fn bias-tz)
+    this)
   IFn
   (invoke [this]
     (forward this)
@@ -269,11 +282,11 @@
     fact)
   DescriptorProvider
   (inf-desc [_]
-    (view dst-desc))
+    dst-desc)
   (train-desc [_]
-    (view dst-desc))
+    dst-desc)
   (diff-desc [_]
-    (view dst-desc))
+    dst-desc)
   TensorDescriptor
   (shape [_]
     (shape dst-desc))
@@ -386,8 +399,8 @@
     (parameters op))
   Initializable
   (init [this init-fn]
-    (init-fn (bias op))
-    (init-fn (weights op))
+    (init op init-fn)
+    (init activ init-fn)
     this)
   Transfer
   (input [this]
@@ -474,8 +487,8 @@
     (parameters op))
   Initializable
   (init [this init-fn]
-    (init-fn (bias op))
-    (init-fn (weights op))
+    (init op init-fn)
+    (init activ init-fn)
     this)
   IFn
   (invoke [_]
@@ -581,8 +594,8 @@
     (parameters op))
   Initializable
   (init [this init-fn]
-    (init-fn (bias op))
-    (init-fn (weights op))
+    (init op init-fn)
+    (init activ init-fn)
     this)
   IFn
   (invoke [_]
@@ -868,11 +881,11 @@
     fact)
   DescriptorProvider
   (inf-desc [_]
-    (view mask-desc))
+    mask-desc)
   (train-desc [_]
-    (view mask-desc))
+    mask-desc)
   (diff-desc [_]
-    (view mask-desc))
+    mask-desc)
   TensorDescriptor
   (shape [this]
     (shape mask-desc))

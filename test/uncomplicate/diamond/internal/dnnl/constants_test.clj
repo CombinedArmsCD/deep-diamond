@@ -6,12 +6,13 @@
 ;;   the terms of this license.
 ;;   You must not remove this notice, or any other, from this software.
 
-(ns uncomplicate.diamond.internal.dnnl.constants-test
+(ns ^{:author "Dragan Djuric"}
+    uncomplicate.diamond.internal.dnnl.constants-test
   (:require [midje.sweet :refer [facts =>]]
             [uncomplicate.diamond.internal.dnnl.constants :refer :all]))
 
 (facts "DNNL format tests."
-       (remove identity (map #(= % (dnnl-format (dec-format %))) (range 43))) => [])
+       (remove identity (map #(= % (dnnl-format (dec-format %))) (range 52))) => [])
 
 (facts "DNNL data-type tests."
        (remove identity (map #(= % (dnnl-data-type (dec-data-type %))) (range 7)))

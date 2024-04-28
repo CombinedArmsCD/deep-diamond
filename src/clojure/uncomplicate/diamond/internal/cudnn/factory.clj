@@ -6,12 +6,15 @@
 ;;   the terms of this license.
 ;;   You must not remove this notice, or any other, from this software.
 
-(ns uncomplicate.diamond.internal.cudnn.factory
+(ns ^{:author "Dragan Djuric"}
+    uncomplicate.diamond.internal.cudnn.factory
+  (:refer-clojure :exclude [abs])
   (:require [clojure.java.io :as io]
             [uncomplicate.commons
              [core :refer [Releaseable release let-release with-release view]]
              [utils :refer [dragan-says-ex]]]
-            [uncomplicate.fluokitten.core :refer [op]]
+            [uncomplicate.fluokitten.core :refer [op extract]]
+            [uncomplicate.clojure-cpp :refer [byte-pointer]]
             [uncomplicate.clojurecuda
              [core :refer :all]
              [toolbox :refer [read-int]]]
@@ -22,14 +25,14 @@
             [uncomplicate.diamond.tensor :refer [shape data-type layout output]]
             [uncomplicate.diamond.internal
              [protocols :refer [TensorFactory DiamondFactoryProvider NeanderthalFactoryProvider
-                                CostFactory DnnFactory RnnFactory]]
+                                CostFactory DnnFactory RnnFactory batch-index]]
              [utils :refer [check-contiguous]]
              [cost :refer [quadratic-cost! mean-absolute-cost! crossentropy-cost!]]]
             [uncomplicate.diamond.internal.dnnl.factory :refer [dnnl-factory]]
             [uncomplicate.diamond.internal.neanderthal.directed :refer [neanderthal-fc-blueprint]]
             [uncomplicate.diamond.internal.cudnn
              [protocols :refer [HandleProvider desc]]
-             [core :refer [cudnn-handle get-cudnn-stream ndims dims
+             [core :refer [cudnn-context get-cudnn-stream ndims dims
                            strides transform-tensor set-tensor scale-tensor add-tensor]]
              [tensor :refer [cudnn-tensor cudnn-transformer cudnn-batcher cudnn-shuffler
                              cudnn-tensor-desc]]
@@ -38,8 +41,7 @@
                                cudnn-convolution-layer-blueprint cudnn-gaussian-dropout-blueprint
                                cudnn-batch-norm-layer-blueprint cudnn-branch-blueprint
                                cudnn-concat-blueprint cudnn-sum-blueprint cudnn-split-blueprint]]
-             [rnn :refer [cudnn-rnn-op-blueprint cudnn-rnn-blueprint cudnn-abbreviate-blueprint]]])
-  (:import jcuda.jcudnn.JCudnn))
+             [rnn :refer [cudnn-rnn-op-blueprint cudnn-rnn-blueprint cudnn-abbreviate-blueprint]]]))
 
 (def ^{:private true :const true} INEFFICIENT_OPERATION_MSG
   "This operation would be inefficient because it does not use cuDNN capabilities.
@@ -51,69 +53,66 @@ Please contribute towards making it possible, or use on of the supported types."
 
 (defn ^:private tensor-1d-equals [modl hstream x y]
   (with-release [equals-kernel (function modl "tensor_1d_equals")
-                 eq-flag-buf (mem-alloc Integer/BYTES)]
+                 eq-flag-buf (mem-alloc-driver Integer/BYTES)]
     (let [n (first (dims x))]
       (memset! eq-flag-buf 0)
       (launch! equals-kernel (grid-1d n) hstream
-               (parameters (int n)
-                           (buffer x) (int (offset x)) (int (first (strides x)))
-                           (buffer y) (int (offset y)) (int (first (strides y)))
+               (parameters n
+                           (extract x) (offset x) (first (strides x))
+                           (extract y) (offset y) (first (strides y))
                            eq-flag-buf))
       (= 0 (read-int hstream eq-flag-buf)))))
 
 (defn ^:private tensor-2d-equals [modl hstream x y]
   (with-release [equals-kernel (function modl "tensor_2d_equals")
-                 eq-flag-buf (mem-alloc Integer/BYTES)]
+                 eq-flag-buf (mem-alloc-driver Integer/BYTES)]
     (let [[n c] (dims x)
           [nx cx] (strides x)
           [ny cy] (strides y)]
       (memset! eq-flag-buf 0)
       (launch! equals-kernel (grid-2d n c) hstream
-               (parameters (int n) (int c)
-                           (buffer x) (int (offset x)) (int nx) (int cx)
-                           (buffer y) (int (offset y)) (int ny) (int cy)
-                           eq-flag-buf))
+               (parameters n c (extract x) (offset x) nx cx (extract y) (offset y) ny cy eq-flag-buf))
       (= 0 (read-int hstream eq-flag-buf)))))
 
 (defn ^:private tensor-3d-equals [modl hstream x y]
   (with-release [equals-kernel (function modl "tensor_3d_equals")
-                 eq-flag-buf (mem-alloc Integer/BYTES)]
+                 eq-flag-buf (mem-alloc-driver Integer/BYTES)]
     (let [[n c h] (dims x)
           [nx cx hx] (strides x)
           [ny cy hy] (strides y)]
       (memset! eq-flag-buf 0)
       (launch! equals-kernel (grid-2d n c h) hstream
-               (parameters (int n) (int c) (int h)
-                           (buffer x) (int (offset x)) (int nx) (int cx) (int hx)
-                           (buffer y) (int (offset y)) (int ny) (int cy) (int hy)
+               (parameters n c h
+                           (extract x) (offset x) nx cx hx
+                           (extract y) (offset y) ny cy hy
                            eq-flag-buf))
       (= 0 (read-int hstream eq-flag-buf)))))
 
 (defn ^:private tensor-4d-equals [modl hstream x y]
   (with-release [equals-kernel (function modl "tensor_4d_equals")
-                 eq-flag-buf (mem-alloc Integer/BYTES)]
+                 eq-flag-buf (mem-alloc-driver Integer/BYTES)]
     (let [[n c h w] (dims x)
           [nx cx hx wx] (strides x)
           [ny cy hy wy] (strides y)]
       (memset! eq-flag-buf 0)
       (launch! equals-kernel (grid-3d n c h) hstream
-               (parameters (int n) (int c) (int h) (int w)
-                           (buffer x) (int (offset x)) (int nx) (int cx) (int hx) (int wx)
-                           (buffer y) (int (offset y)) (int ny) (int cy) (int hy) (int wy)
+               (parameters n c h w
+                           (extract x) (offset x) nx cx hx wx
+                           (extract y) (offset y) ny cy hy  wy
                            eq-flag-buf))
       (= 0 (read-int hstream eq-flag-buf)))))
 
 (defn ^:private tensor-5d-equals [modl hstream x y]
   (with-release [equals-kernel (function modl "tensor_5d_equals")
-                 eq-flag-buf (mem-alloc Integer/BYTES)]
+                 eq-flag-buf (mem-alloc-driver Integer/BYTES)]
     (let [[n c d h w] (dims x)
           [nx cx dx hx wx] (strides x)
           [ny cy dy hy wy] (strides y)]
       (memset! eq-flag-buf 0)
       (launch! equals-kernel (grid-3d n c h) hstream
                (parameters (int n) (int c) (int d) (int h) (int w)
-                           (buffer x) (int (offset x)) (int nx) (int cx) (int dx) (int hx) (int wx)
-                           (buffer y) (int (offset y)) (int ny) (int cy) (int dy) (int hy) (int wy)
+                           (extract x) (int (offset x)) (int nx) (int cx) (int dx) (int hx) (int wx)
+                           (extract y) (int (offset y)) (int ny) (int cy) (int dy) (int hy) (int wy)
                            eq-flag-buf))
       (= 0 (read-int hstream eq-flag-buf)))))
 
@@ -155,18 +154,16 @@ Please contribute towards making it possible, or use on of the supported types."
      (method (engine va) va (view-vctr b) (view-vctr y))
      y)))
 
-(deftype TensorEngine [cudnn-hdl modl hstream cast ^long byte-cnt]
+(deftype TensorEngine [cudnn-hdl modl hstream cast]
   BlockEngine
   (equals-block [_ x y]
     (tensor-equals modl hstream x y))
   Blas
   (copy [_ x y]
-    (transform-tensor cudnn-hdl (cast 1.0) x (buffer x) (* (offset y) byte-cnt)
-                      (cast 0.0) y (buffer y) (* (offset y) byte-cnt))
+    (transform-tensor cudnn-hdl (cast 1.0) x (byte-pointer (buffer x)) (cast 0.0) y (byte-pointer (buffer y)))
     y)
   (axpy [_ alpha x y]
-    (add-tensor cudnn-hdl (cast alpha) x (buffer x) (* (offset y) byte-cnt)
-                (cast 1.0) y (buffer y) (* (offset y) byte-cnt))
+    (add-tensor cudnn-hdl (cast alpha) x (byte-pointer (buffer x)) (cast 1.0) y (byte-pointer (buffer y)))
     y)
   (swap [_ x y]
     (tensor-method swap x y)
@@ -180,9 +177,7 @@ Please contribute towards making it possible, or use on of the supported types."
   (nrmi [this x]
     (tensor-method nrmi x))
   (scal [_ alpha x]
-    (if (= 0 (offset x))
-      (scale-tensor cudnn-hdl (cast alpha) x (buffer x))
-      (scale-tensor cudnn-hdl (cast alpha) x (buffer x) (* (offset x) byte-cnt)))
+    (scale-tensor cudnn-hdl (cast alpha) x (buffer x))
     x)
   BlasPlus
   (amax [_ x]
@@ -190,13 +185,10 @@ Please contribute towards making it possible, or use on of the supported types."
   (sum [_ x]
     (tensor-method sum x))
   (set-all [_ value x]
-    (if (= 0 (offset x))
-      (set-tensor cudnn-hdl x (buffer x) (cast value))
-      (set-tensor cudnn-hdl x (buffer x) (* (offset x) byte-cnt) (cast value)))
+    (set-tensor cudnn-hdl x (byte-pointer (buffer x)) (cast value))
     x)
   (axpby [_ alpha x beta y]
-    (add-tensor cudnn-hdl (cast alpha) x (buffer x) (* (offset y) byte-cnt)
-                (cast beta) y (buffer y) (* (offset y) byte-cnt))
+    (add-tensor cudnn-hdl (cast alpha) x (buffer x) (cast beta) y (buffer y))
     y)
   VectorMath
   (sqr [_ a y]
@@ -409,12 +401,12 @@ Please contribute towards making it possible, or use on of the supported types."
   (create-workspace [_ byte-size]
     (in-context
      ctx
-     (mem-alloc (max 1 (long byte-size)))))
+     (cuda-malloc (max 1 (long byte-size)))))
   RnnFactory
   (rnn-op-blueprint [this src-desc dst-desc weights-type activ dir lrs src-iter? dst-iter?]
     (cudnn-rnn-op-blueprint this cudnn-hdl src-desc dst-desc weights-type
                             activ dir lrs src-iter? dst-iter?))
-  (rnn-blueprint [fact src-desc dst-desc lrs activ _ _ weights-type src-iter? dst-iter?]
+  (rnn-blueprint [fact src-desc dst-desc lrs activ _ weights-type src-iter? dst-iter?]
     (cudnn-rnn-blueprint fact cudnn-hdl src-desc dst-desc lrs activ weights-type src-iter? dst-iter?))
   (abbreviate-blueprint [fact src-desc dst-type]
     (cudnn-abbreviate-blueprint fact src-desc dst-type))
@@ -425,10 +417,7 @@ Please contribute towards making it possible, or use on of the supported types."
     (cudnn-universal-cost prev-layer train-tz mean-absolute-cost!))
   (crossentropy-cost [_ prev-layer train-tz]
     (cudnn-custom-cost prev-layer train-tz
-                       (partial crossentropy-cost!
-                                ((dims (output prev-layer)) 0)))))
-
-(JCudnn/setExceptionsEnabled false)
+                       (partial crossentropy-cost! ((dims train-tz) (batch-index train-tz))))))
 
 (defn ^:private create-module [src dtype]
   (with-release [prog (compile! (program src) [(str "-DTYPE=" dtype) "-default-device"])]
@@ -447,11 +436,11 @@ Please contribute towards making it possible, or use on of the supported types."
                   long-fact (cuda-long ctx hstream)
                   int-fact (cuda-int ctx hstream)
                   byte-fact (cuda-byte ctx hstream)
-                  float-engine (->TensorEngine cudnn-hdl float-modl hstream float Float/BYTES)
-                  double-engine (->TensorEngine cudnn-hdl double-modl hstream double Double/BYTES)
-                  long-engine (->TensorEngine cudnn-hdl long-modl hstream long Long/BYTES)
-                  int-engine (->TensorEngine cudnn-hdl int-modl hstream int Integer/BYTES)
-                  byte-engine (->TensorEngine cudnn-hdl byte-modl hstream byte Byte/BYTES)]
+                  float-engine (->TensorEngine cudnn-hdl float-modl hstream float)
+                  double-engine (->TensorEngine cudnn-hdl double-modl hstream double)
+                  long-engine (->TensorEngine cudnn-hdl long-modl hstream long)
+                  int-engine (->TensorEngine cudnn-hdl int-modl hstream int)
+                  byte-engine (->TensorEngine cudnn-hdl byte-modl hstream byte)]
       (->CUDnnFactory ctx hstream cudnn-hdl master
                       native-diamond-fact
                       {:float float-fact
@@ -471,7 +460,7 @@ Please contribute towards making it possible, or use on of the supported types."
   ([ctx hstream]
    (in-context
     ctx
-    (let-release [cudnn-hdl (cudnn-handle hstream)
+    (let-release [cudnn-hdl (cudnn-context hstream)
                   hstream (get-cudnn-stream cudnn-hdl)]
       (create-cudnn-factory ctx hstream cudnn-hdl false))))
   ([]
@@ -480,5 +469,5 @@ Please contribute towards making it possible, or use on of the supported types."
      (in-context
       ctx
       (let-release [hstream (stream)
-                    cudnn-hdl (cudnn-handle hstream)]
+                    cudnn-hdl (cudnn-context hstream)]
         (create-cudnn-factory ctx hstream cudnn-hdl true))))))

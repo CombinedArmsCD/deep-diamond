@@ -6,14 +6,17 @@
 ;;   the terms of this license.
 ;;   You must not remove this notice, or any other, from this software.
 
-(ns uncomplicate.diamond.tensor-test
+(ns ^{:author "Dragan Djuric"}
+    uncomplicate.diamond.tensor-test
   (:require [midje.sweet :refer [facts throws =>]]
-            [uncomplicate.commons
-             [core :refer [with-release release]]]
+            [uncomplicate.commons.core :refer [with-release release]]
+            [uncomplicate.fluokitten.core :refer [fmap! fmap fold]]
+            [uncomplicate.clojure-cpp :refer [position! pointer get-entry]]
             [uncomplicate.neanderthal
              [core :refer [asum view-vctr transfer! native entry entry! dim]]
              [block :refer [buffer contiguous?]]]
-            [uncomplicate.diamond.tensor :refer :all])
+            [uncomplicate.diamond.tensor :refer :all]
+            [uncomplicate.diamond.internal.protocols :refer [offset]])
   (:import clojure.lang.ExceptionInfo))
 
 (defn test-tensor [fact]
@@ -22,6 +25,13 @@
            (asum tz) => 0.0
            (asum (entry! tz 1)) => 120.0
            (shape tz) => [2 3 4 5])))
+
+(defn test-tensor1 [fact]
+  (with-release [tz (tensor fact [2 3 4 5] :float :nchw)]
+    (
+     (asum tz)
+     (asum (entry! tz 1))
+     (shape tz))))
 
 (defn test-create [fact]
   (with-release [t1 (tensor fact [1 1 1 1] :float :nchw)
@@ -46,7 +56,7 @@
     (facts "Equality and hash code tests."
            (.equals x1 nil) => false
            (= x1 y1) => true
-           ;; (= x1 y3) => false ;;TODO
+           (= x1 y3) => false
            (= x1 y4) => false
            (= x5 y5) => false
            (transfer! (range) x1) => (transfer! (range) y1))))
@@ -95,12 +105,45 @@
            (seq (native sub-x)) => [0.0 1.0]
            (seq (native sub-y)) => [0.0 1.0 2.0]
            (seq (native sub-z)) => [0.0 1.0 2.0 3.0]
-           (seq (native (offset! sub-y 3))) => [3.0 4.0 5.0]
+           (position! (buffer sub-y) 3)
+           (seq (native sub-y)) => [3.0 4.0 5.0]
            (seq (native sub-x)) => [0.0 1.0]
-           (seq (native (offset! sub-z 1))) => [1.0 2.0 3.0 4.0]
+           (position! (buffer sub-z) 1)
+           (seq (native sub-z)) => [1.0 2.0 3.0 4.0]
            (seq (native sub-x)) => [0.0 1.0])))
 
-;; TODO implement and test fluokitten support.
+(defn test-tensor-fold [fact]
+  (with-release [x (transfer! [1 2 3 4 5 6] (tensor fact [2 3 1 1] :float :nchw))
+                 *' (fn ^double [^double x ^double y]
+                      (* x y))
+                 +' (fn ^double [^double x ^double y]
+                      (+ x y))]
+    (facts "Fold implementation for tensors."
+
+           (fold x) => 21.0
+           (fold *' 1.0 x) => 720.0
+           (fold +' 0.0 x) => (fold x))))
+
+(defn test-tensor-reducible [fact]
+  (with-release [y (transfer! [1 2 3 4 5 6] (tensor fact [2 3 1 1] :float :nchw))
+                 x (transfer! [10 20 30 40 50 60] (tensor fact [2 3 1 1] :float :nchw))
+                 pf1 (fn ^double [^double res ^double x] (+ x res))
+                 pf1o (fn [res ^double x] (conj res x))]
+    (facts "Reducible implementation for tensors."
+
+           (fold pf1 1.0 x) => 211.0
+           (fold pf1o [] x) => [10.0 20.0 30.0 40.0 50.0 60.0]
+
+           (fold pf1 1.0 x y) => 232.0
+           (fold pf1o [] x y) => [11.0 22.0 33.0 44.0 55.0 66.0]
+
+           (fold pf1 1.0 x y y) => 253.0
+           (fold pf1o [] x y y) => [12.0 24.0 36.0 48.0 60.0 72.0]
+
+           (fold pf1 1.0 x y y y) => 274.0
+           (fold pf1o [] x y y y) => [13.0 26.0 39.0 52.0 65.0 78.0]
+
+           (fold + 1.0 x y y y) => 274.0)))
 
 (defn test-transformer [fact]
   (with-release [tz-x (tensor fact [2 3 4 5] :float :nchw)
@@ -127,8 +170,8 @@
                  connection (connector tz-x tz-y-desc)]
     (facts "Tensor pull connector with different destination"
            (entry (view-vctr (native (transfer! (range) tz-x))) 119) => 119.0
-           (identical? (buffer (input connection)) (buffer tz-x)) => true
-           (identical? (buffer (input connection)) (buffer (output connection))) => false
+           (= (buffer (input connection)) (buffer tz-x)) => true
+           (= (buffer (input connection)) (buffer (output connection))) => false
            (entry (native (view-vctr (connection))) 119) => 119.0)))
 
 (defn test-pull-same [fact]
@@ -137,8 +180,8 @@
                  connection (connector tz-x tz-y-desc)]
     (facts "Tensor pull connector with the same destination"
            (entry (view-vctr (native (transfer! (range) tz-x))) 119) => 119.0
-           (identical? (buffer (input connection)) (buffer tz-x)) => true
-           (identical? (buffer (input connection)) (buffer (output connection))) => true
+           (= (buffer (input connection)) (buffer tz-x)) => true
+           (= (buffer (input connection)) (buffer (output connection))) => true
            (entry (native (view-vctr (connection))) 119) => 119.0)))
 
 (defn test-push-different [fact]
@@ -147,8 +190,8 @@
                  connection (connector tz-x-desc tz-y)]
     (facts "Tensor push connector with different destination"
            (entry (native (transfer! (range) (view-vctr (input connection)))) 119) => 119.0
-           (identical? (buffer (output connection)) (buffer tz-y)) => true
-           (identical? (buffer (input connection)) (buffer (output connection))) => false
+           (= (buffer (output connection)) (buffer tz-y)) => true
+           (= (buffer (input connection)) (buffer (output connection))) => false
            (entry (native (view-vctr (connection))) 119) => 119.0)))
 
 (defn test-push-same [fact]
@@ -157,8 +200,8 @@
                  connection (connector tz-x-desc tz-y)]
     (facts "Tensor push connector with the same destination"
            (entry (native (transfer! (range) (view-vctr (input connection)))) 119) => 119.0
-           (identical? (buffer (output connection)) (buffer tz-y)) => true
-           (identical? (buffer (input connection)) (buffer (output connection))) => true
+           (= (buffer (output connection)) (buffer tz-y)) => true
+           (= (buffer (input connection)) (buffer (output connection))) => true
            (entry (native (view-vctr (connection))) 119) => 119.0)))
 
 (defn test-shuffler [fact]
@@ -198,32 +241,30 @@
            (batch -1) => (throws ExceptionInfo))))
 
 (defn test-batcher-tnc [fact]
-  (with-release [tz-x (tensor fact [2 7 1] :float :tnc)
+  (with-release [tz-x-ntc (tensor fact [2 7 1] :float :ntc)
+                 tz-x (tensor fact [2 7 1] :float :tnc)
                  tz-y (tensor fact [2 3 1] :float :tnc)
-                 sub-x (view-tz tz-x [2 3 1])
-                 batch (batcher tz-x tz-y 1)
-                 batch-2 (batcher tz-x tz-y 2)
-                 ];;TODO
+                 sub-x (view-tz tz-x 3)
+                 batch (batcher tz-x tz-y 3)
+                 batch-2 (batcher tz-x tz-y 2)]
     (facts "batcher test."
            (transfer! (range 1 15) tz-x)
-           (seq (transfer! sub-x (tensor fact [2 3 1] :float :tnc)))
-           => [1.0 2.0 3.0 8.0 9.0 10.0]
-           (seq (transfer! (offset! sub-x 3) (tensor fact [2 3 1] :float :tnc)))
-           => [4.0 5.0 6.0 11.0 12.0 13.0]
-           (seq (transfer! (offset! sub-x 6) (tensor fact [2 3 1] :float :tnc)))
-           => (throws ExceptionInfo)
-           ;; (seq (native tz-x)) => (range 1.0 15.0)
-           ;; (seq (native tz-y)) => (repeat 6 0.0)
-           ;; (batch 0 0) => tz-y
-           ;; (seq (native tz-y)) => [1.0 3.0 5.0 2.0 4.0 6.0]
-           ;; (transfer! (repeat 0) tz-y)
-           ;; (batch 1 0) => tz-y
-           ;; (seq (native tz-y)) => [3.0 5.0 7.0 4.0 6.0 8.0]
-           ;; (transfer! (repeat 0) tz-y)
-           ;; (batch-2 1 1) => tz-y
-           ;; (seq (native tz-y)) => [0.0 3.0 5.0 0.0 4.0 6.0]
-           ;; (batch 8) => (throws ExceptionInfo)
-           ;; (batch 0 -1) => (throws ExceptionInfo)
-           ;; (batch 7 -1) => (throws ExceptionInfo)
-           ;; (batch -1) => (throws ExceptionInfo)
-           )))
+           (seq (native (transfer! sub-x (tensor fact [2 3 1] :float :tnc)))) => [1.0 2.0 3.0 8.0 9.0 10.0]
+           (seq (native (transfer! (doto sub-x (offset! 3))
+                                   (tensor fact [2 3 1] :float :tnc)))) => [4.0 5.0 6.0 11.0 12.0 13.0]
+           (transfer! (range 1 15) tz-x-ntc)
+           (transfer! tz-x-ntc tz-x)
+           (seq (native tz-x)) => [1.0 3.0 5.0 7.0 9.0 11.0 13.0 2.0 4.0 6.0 8.0 10.0 12.0 14.0]
+           (seq (native tz-y)) => (repeat 6 0.0)
+           (batch 0 0) => tz-y
+           (seq (native tz-y)) => [1.0 3.0 5.0 2.0 4.0 6.0]
+           (transfer! (repeat 0) tz-y)
+           (batch 1 0) => tz-y
+           (seq (native tz-y)) => [3.0 5.0 7.0 4.0 6.0 8.0]
+           (transfer! (repeat 0) tz-y)
+           (batch-2 1 1) => tz-y
+           (seq (native tz-y)) => [0.0 3.0 5.0 0.0 4.0 6.0]
+           (batch 8) => (throws ExceptionInfo)
+           (batch 0 -1) => (throws ExceptionInfo)
+           (batch 7 -1) => (throws ExceptionInfo)
+           (batch -1) => (throws ExceptionInfo))))

@@ -1,14 +1,22 @@
-(ns uncomplicate.diamond.internal.cudnn.directed
+;;   Copyright (c) Dragan Djuric. All rights reserved.
+;;   The use and distribution terms for this software are covered by the
+;;   Eclipse Public License 1.0 (http://opensource.org/licenses/eclipse-1.0.php) or later
+;;   which can be found in the file LICENSE at the root of this distribution.
+;;   By using this software in any fashion, you are agreeing to be bound by
+;;   the terms of this license.
+;;   You must not remove this notice, or any other, from this software.
+
+(ns ^{:author "Dragan Djuric"}
+    uncomplicate.diamond.internal.cudnn.directed
   (:require [uncomplicate.commons.core
-             :refer [Releaseable release let-release with-release Info info view]]
+             :refer [Releaseable release let-release with-release Info info view bytesize]]
             [uncomplicate.fluokitten.core :refer [fmap]]
-            [uncomplicate.clojurecuda.core :refer [mem-alloc]]
+            [uncomplicate.clojure-cpp :refer [pointer]]
             [uncomplicate.neanderthal
              [core :refer [axpby! axpy! copy! transfer! raw view-vctr entry! scal!]]
              [block :refer [cast-prim data-accessor buffer offset]]]
             [uncomplicate.diamond
-             [tensor :as tz
-              :refer [Transfer input output connector revert shape layout TensorDescriptor ]]]
+             [tensor :as tz :refer [Transfer input output connector revert shape layout TensorDescriptor]]]
             [uncomplicate.diamond.internal
              [protocols
               :refer [Parameters bias weights ParametersSeq parameters DescriptorProvider
@@ -32,7 +40,7 @@
 (defn cudnn-contiguous-desc [md]
   (let [s (shape md)]
     (if (and (= :float (data-type md))
-             (= (size md) (apply * Float/BYTES s)))
+             (= (bytesize md) (apply * Float/BYTES s)))
       (view md)
       (cudnn-tensor-desc s :float (default-strides s)))))
 
@@ -55,6 +63,9 @@
     data-tz)
   (output [_]
     data-tz)
+  Initializable
+  (init [this _]
+    this)
   IFn
   (invoke [_]
     (when-not linear
@@ -94,6 +105,9 @@
     dst-tz)
   (diff-output [_]
     diff-src-tz)
+    Initializable
+  (init [this _]
+    this)
   IFn
   (invoke [this]
     (forward this)
@@ -141,6 +155,9 @@
     diff-dst-tz)
   (diff-output [_]
     diff-src-tz)
+    Initializable
+  (init [this _]
+    this)
   IFn
   (invoke [_]
     (activation-forward cudnn-hdl activation-desc
@@ -178,11 +195,11 @@
     fact)
   DescriptorProvider
   (inf-desc [_]
-    (view inf-desc))
+    inf-desc)
   (train-desc [_]
-    (view train-desc))
+    train-desc)
   (diff-desc [_]
-    (view diff-desc))
+    diff-desc)
   TensorDescriptor
   (shape [_]
     (shape train-desc))
@@ -268,6 +285,9 @@
     diff-dst-tz)
   (diff-output [_]
     diff-src-tz)
+  Initializable
+  (init [this _]
+    this)
   IFn
   (invoke [_]
     (softmax-forward cudnn-hdl :accurate :instance
@@ -304,11 +324,11 @@
     fact)
   DescriptorProvider
   (inf-desc [_]
-    (view inf-desc))
+    inf-desc)
   (train-desc [_]
-    (view train-desc))
+    train-desc)
   (diff-desc [_]
-    (view diff-desc))
+    diff-desc)
   TensorDescriptor
   (shape [_]
     (shape train-desc))
@@ -474,6 +494,11 @@
   ParametersSeq
   (parameters [_]
     [weights-tz bias-tz])
+  Initializable
+  (init [this init-fn]
+    (init-fn weights-tz)
+    (init-fn bias-tz)
+    this)
   IFn
   (invoke [_]
     (src-conn)
@@ -534,6 +559,11 @@
   DiffParameters
   (diff-weights [_]
     diff-weights-tz)
+  Initializable
+  (init [this init-fn]
+    (init-fn weights-tz)
+    (init-fn bias-tz)
+    this)
   IFn
   (invoke [this]
     (forward this)
@@ -624,11 +654,11 @@
     fact)
   DescriptorProvider
   (inf-desc [_]
-    (view dst-desc))
+    dst-desc)
   (train-desc [_]
-    (view dst-desc))
+    dst-desc)
   (diff-desc [_]
-    (view dst-desc))
+    dst-desc)
   TensorDescriptor
   (shape [_]
     (shape dst-desc))
@@ -851,12 +881,12 @@
   (hashCode [this]
     (-> (hash :pooling)
         (hash-combine algo)
-        (hash-combine (train-desc this))))
+        (hash-combine dst-desc)))
   (equals [this other]
     (and (instance? CUDnnPoolingBlueprint other)
          (= algo (.algo ^CUDnnPoolingBlueprint other))
          (= (inf-desc this) (inf-desc other))
-         (= (train-desc this) (train-desc other))))
+         (= dst-desc (.-dst-desc ^CUDnnPoolingBlueprint other))))
   (toString [this]
     (str {:algo algo
           :shape (shape this)
@@ -877,11 +907,11 @@
     fact)
   DescriptorProvider
   (inf-desc [_]
-    (view dst-desc))
+    dst-desc)
   (train-desc [_]
-    (view dst-desc))
+    dst-desc)
   (diff-desc [_]
-    "TODO")
+    dst-desc)
   TensorDescriptor
   (shape [_]
     (shape dst-desc))
@@ -1414,7 +1444,7 @@
   (invoke [this prev-layer]
     (let [src-tz (output prev-layer)]
       (let-release [dst-tzs (fmap (partial cudnn-tensor fact) dst-descs)
-                    sub-tzs (mapv #(cudnn-tensor fact false (buffer src-tz) (+ (offset src-tz) (long %1)) %2)
+                    sub-tzs (mapv #(cudnn-tensor fact false (pointer (buffer src-tz) %1) %2)
                                   sub-offsets sub-descs)
                     fwd-trans (mapv (partial cudnn-transformer cudnn-hdl) sub-tzs dst-tzs)]
         (->CUDnnBranchInference fact this true src-tz fwd-trans))))
@@ -1424,9 +1454,9 @@
           diff-src-sub-offsets (mapv (partial * (get (strides diff-src-tz) branch-dim))
                                      (concat-offsets branch-dim dst-dims))]
       (let-release [dst-tzs (fmap (partial cudnn-tensor fact) dst-descs)
-                    src-sub-tzs (mapv #(cudnn-tensor fact false (buffer src-tz) %1 %2)
+                    src-sub-tzs (mapv #(cudnn-tensor fact false (pointer (buffer src-tz) %1) %2)
                                       sub-offsets sub-descs)
-                    diff-src-sub-tzs (mapv #(cudnn-tensor fact false (buffer diff-src-tz) %1 %2)
+                    diff-src-sub-tzs (mapv #(cudnn-tensor fact false (pointer (buffer diff-src-tz) %1) %2)
                                            diff-src-sub-offsets sub-descs)
                     fwd-trans (mapv (partial cudnn-transformer cudnn-hdl) src-sub-tzs dst-tzs)
                     bwd-trans (mapv (partial cudnn-transformer cudnn-hdl) dst-tzs diff-src-sub-tzs)]
@@ -1486,15 +1516,15 @@
   (invoke [this prev-layer]
     (let-release [src-tzs (fmap (comp view output) prev-layer)
                   dst-tz (cudnn-tensor fact dst-desc)
-                  sub-tzs (mapv #(cudnn-tensor fact false (buffer dst-tz) (+ (offset dst-tz) (long %1)) %2)
-                               sub-offsets sub-descs)
+                  sub-tzs (mapv #(cudnn-tensor fact false (pointer (buffer dst-tz) %1) %2)
+                                sub-offsets sub-descs)
                   fwd-trans (mapv (partial cudnn-transformer cudnn-hdl) src-tzs sub-tzs)]
       (->CUDnnBranchInference fact this false dst-tz fwd-trans)))
   (invoke [this prev-layer prop-diff? _]
     (let [src-tzs (fmap (comp view output) prev-layer)
           diff-src-tzs (fmap (comp view diff-input) prev-layer)]
       (let-release [dst-tz (cudnn-tensor fact dst-desc)
-                    sub-tzs (mapv #(cudnn-tensor fact false (buffer dst-tz) (+ (offset dst-tz) (long %1)) %2)
+                    sub-tzs (mapv #(cudnn-tensor fact false (pointer (buffer dst-tz) %1) %2)
                                   sub-offsets sub-descs)
                     fwd-trans (mapv (partial cudnn-transformer cudnn-hdl) src-tzs sub-tzs)
                     bwd-trans (mapv (partial cudnn-transformer cudnn-hdl) sub-tzs diff-src-tzs)]
@@ -1653,8 +1683,8 @@
     (train-desc this))
   (train-desc [_]
     (vec (repeat n src-desc)))
-  (diff-desc [_]
-    "TODO")
+  (diff-desc [this]
+    (train-desc this))
   TensorDescriptor
   (shape [_]
     (vec (repeat n (shape src-desc))))
@@ -1779,7 +1809,7 @@
   (train-desc [_]
     (get src-descs 0))
   (diff-desc [_]
-    "TODO")
+    (get src-descs 0))
   TensorDescriptor
   (shape [_]
     (shape (get src-descs 0)))

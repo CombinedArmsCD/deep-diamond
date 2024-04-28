@@ -6,16 +6,18 @@
 ;;   the terms of this license.
 ;;   You must not remove this notice, or any other, from this software.
 
-(ns uncomplicate.diamond.internal.dnnl.file-channel
+(ns ^{:author "Dragan Djuric"}
+    uncomplicate.diamond.internal.dnnl.file-channel
   (:require [uncomplicate.commons
-             [core :refer [let-release with-release]]
+             [core :refer [let-release with-release bytesize]]
              [utils :refer [dragan-says-ex mapped-buffer]]]
+            [uncomplicate.clojure-cpp :refer [type-pointer]]
             [uncomplicate.neanderthal.core :refer [transfer!]]
+            [uncomplicate.diamond.tensor :refer [data-type]]
             [uncomplicate.diamond.internal
              [protocols :refer [diamond-factory native-diamond-factory parameters]]
              [network :refer []]]
             [uncomplicate.diamond.internal.dnnl
-             [core :refer [size]]
              [protocols :refer [desc]]
              [tensor :refer [dnnl-tensor*]]])
   (:import java.nio.channels.FileChannel
@@ -23,10 +25,13 @@
             SequentialNetworkTraining]))
 
 (defn map-channel
+  "Maps a new tensor to a channel via `commons/utils/mapped-buffer`. Please note that the mapping
+  remains active and uses resources until the tensor is released *and all references to it removed*,
+  because the mapping is only managed by Java's GC, and there is no way of directly affecting that mapping."
   ([fact channel td flag offset-bytes n-index]
    (let [fact (diamond-factory fact)
-         size (size (desc td))]
-     (let-release [buf (mapped-buffer channel offset-bytes size flag)]
+         size (bytesize (desc td))]
+     (let-release [buf ((type-pointer (data-type td)) (mapped-buffer channel offset-bytes size flag))]
        (dnnl-tensor* fact td buf n-index true))))
   ([fact channel td flag offset-bytes]
    (map-channel fact channel td flag offset-bytes 0))
@@ -44,7 +49,7 @@
                           :read-write (transfer! param mapped-param)
                           :read (transfer! mapped-param param)
                           (dragan-says-ex "You can only :read or :read-write a channel!"))
-                        (+ pos (size mapped-param))))
+                        (+ pos (bytesize mapped-param))))
                     pos (parameters layer)))
           0 net)
   channel)

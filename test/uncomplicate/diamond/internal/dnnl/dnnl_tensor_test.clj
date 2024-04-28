@@ -1,4 +1,13 @@
-(ns uncomplicate.diamond.internal.dnnl.dnnl-tensor-test
+;;   Copyright (c) Dragan Djuric. All rights reserved.
+;;   The use and distribution terms for this software are covered by the
+;;   Eclipse Public License 1.0 (http://opensource.org/licenses/eclipse-1.0.php) or later
+;;   which can be found in the file LICENSE at the root of this distribution.
+;;   By using this software in any fashion, you are agreeing to be bound by
+;;   the terms of this license.
+;;   You must not remove this notice, or any other, from this software.
+
+(ns ^{:author "Dragan Djuric"}
+    uncomplicate.diamond.internal.dnnl.dnnl-tensor-test
   (:require [midje.sweet :refer [facts throws => truthy]]
             [uncomplicate.commons.core :refer [with-release]]
             [uncomplicate.neanderthal.core :refer [dim]]
@@ -41,7 +50,10 @@
   (test-push-different diamond-factory)
   (test-push-same diamond-factory)
   (test-batcher diamond-factory)
-  (test-shuffler diamond-factory))
+  (test-shuffler diamond-factory)
+  (test-batcher-tnc diamond-factory)
+  (test-tensor-fold diamond-factory)
+  (test-tensor-reducible diamond-factory))
 
 (with-release [eng (engine)
                strm (stream eng)]
@@ -61,4 +73,7 @@
     (test-push-different *diamond-factory*)
     (test-push-same *diamond-factory*)
     (test-batcher *diamond-factory*)
-    (test-shuffler *diamond-factory*)))
+    (test-shuffler *diamond-factory*)
+    (test-batcher-tnc *diamond-factory*)
+    (test-tensor-fold *diamond-factory*)
+    (test-tensor-reducible *diamond-factory*)))

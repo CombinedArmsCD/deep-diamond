@@ -6,39 +6,38 @@
 ;;   the terms of this license.
 ;;   You must not remove this notice, or any other, from this software.
 
-(defproject uncomplicate/deep-diamond "0.26.0"
+(defproject uncomplicate/deep-diamond "0.27.0"
   :description "Fast Clojure Deep Learning Library"
   :author "Dragan Djuric"
   :url "http://github.com/uncomplicate/deep-diamond"
   :license {:name "Eclipse Public License"
             :url "http://www.eclipse.org/legal/epl-v10.html"}
   :dependencies [[org.clojure/clojure "1.11.1"]
-                 [uncomplicate/neanderthal "0.46.0"]
-                 [org.bytedeco/dnnl-platform "2.7.1-1.5.8"]
-                 [org.jcuda/jcudnn "11.8.0"]]
+                 [uncomplicate/neanderthal "0.48.0"]
+                 [org.bytedeco/dnnl-platform "3.3.4-1.5.10"]]
 
   :profiles {:dev {:plugins [[lein-midje "3.2.1"]
-                             [lein-codox "0.10.7"]]
+                             [lein-codox "0.10.8"]]
                    :resource-paths ["data"]
                    :global-vars {*warn-on-reflection* true
                                  *assert* false
                                  *unchecked-math* :warn-on-boxed
                                  *print-length* 128}
-                   :dependencies [[midje "1.10.9"]
-                                  [org.clojure/data.csv "1.0.1"]]
+                   :dependencies [[midje "1.10.10"]
+                                  [codox-theme-rdash "0.1.2"]
+                                  [org.clojure/data.csv "1.0.1"]
+                                  [org.bytedeco/mkl "2024.0-1.5.10" :classifier linux-x86_64-redist]
+                                  [org.bytedeco/cuda "12.3-8.9-1.5.10"  :classifier linux-x86_64-redist]]
+                   :codox {:metadata {:doc/format :markdown}
+                           :source-uri "http://github.com/uncomplicate/deep-diamond/blob/master/{filepath}#L{line}"
+                           :themes [:rdash]
+                           :namespaces [uncomplicate.diamond.tensor
+                                        uncomplicate.diamond.dnn
+                                        uncomplicate.diamond.metrics
+                                        uncomplicate.diamond.native
+                                        uncomplicate.diamond.internal.protocols]
+                           :output-path "docs/codox"}
 
-                   :jvm-opts ^:replace ["-Dclojure.compiler.direct-linking=true"
-                                        "-XX:MaxDirectMemorySize=16g" "-XX:+UseLargePages"
-                                        "--add-opens=java.base/jdk.internal.ref=ALL-UNNAMED"
-                                        "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"]}}
+                   :jvm-opts ^:replace ["-Dclojure.compiler.direct-linking=true"]}}
 
-  :repositories [["snapshots" {:url "https://oss.sonatype.org/content/repositories/snapshots/"
-                               :snapshots true :sign-releases false :checksum :warn :update :daily}]]
-
-  :codox {:metadata {:doc/format :markdown}
-          :src-dir-uri "http://github.com/uncomplicate/deep-diamond/blob/master/"
-          :src-linenum-anchor-prefix "L"
-          :output-path "docs/codox"}
-
-  :javac-options ["-target" "1.8" "-source" "1.8" "-Xlint:-options"]
   :source-paths ["src/clojure" "src/device"])

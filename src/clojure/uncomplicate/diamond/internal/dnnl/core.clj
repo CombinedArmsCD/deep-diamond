@@ -8,16 +8,22 @@
 
 (ns uncomplicate.diamond.internal.dnnl.core
   (:require [uncomplicate.commons
-             [core :refer [let-release with-release wrap extract view]]
-             [utils :refer [enc-keyword direct-buffer capacity dragan-says-ex mask]]]
+             [core :refer [let-release with-release view Info bytesize size]]
+             [utils :refer [enc-keyword dragan-says-ex mask]]]
+            [uncomplicate.fluokitten.protocols :refer [extract]]
+            [uncomplicate.clojure-cpp
+             :refer [int-pointer long-pointer float-pointer pointer-pointer get-entry
+                     fill! pointer-vec safe byte-pointer position! get-pointer put-entry!
+                     type-pointer pointer position capacity null?]]
             [uncomplicate.diamond.internal.utils :refer [default-strides]]
             [uncomplicate.diamond.internal.dnnl
              [impl :refer :all]
              [constants :refer :all]
              [protocols :refer :all]])
-  (:import org.bytedeco.javacpp.Pointer
+  (:import clojure.lang.ExceptionInfo
            org.bytedeco.dnnl.global.dnnl
-           [org.bytedeco.dnnl dnnl_engine dnnl_memory_desc_t dnnl_exec_arg_t]))
+           [org.bytedeco.dnnl dnnl_engine dnnl_memory_desc dnnl_exec_arg_t]
+           [uncomplicate.diamond.internal.dnnl.impl MemoryDescImpl MemoryImpl]))
 
 ;; ===================== Engine ===============================================
 
@@ -30,9 +36,9 @@
    Throws an ExceptionInfo if the `id` does not correspond to a physical device
    or if `kind` is not supported."
   ([^long id kind]
-   (wrap (engine* id (enc-keyword dnnl-engine-kind kind))))
+   (engine* id (enc-keyword dnnl-engine-kind kind)))
   ([^long id]
-   (wrap (engine* id)))
+   (engine* id))
   ([]
    (engine 0)))
 
@@ -57,9 +63,9 @@
     n))
 
 (defn primitive-cache-capacity []
-  (let [res (int-array 1)]
+  (let [res (int-pointer 1)]
     (with-check (dnnl/dnnl_get_primitive_cache_capacity res)
-      (aget res 0))))
+      (get-entry res 0))))
 
 ;; ===================== Stream ===============================================
 
@@ -70,15 +76,14 @@
   [[constants/dnnl-stream-flags]].
   Stream has to be `release`d."
   [eng & flags]
-  (wrap (if flags
-          (stream* (extract eng) (mask dnnl-stream-flags flags))
-          (stream* (extract eng)))))
+  (if flags
+    (stream* (extract eng) (mask dnnl-stream-flags flags))
+    (stream* (extract eng))))
 
 (defn wait!
   "Waits until stream `s` completes execution of all queued operations."
   [strm]
-  (wait* (extract strm))
-  strm)
+  (wait* (extract strm)))
 
 (defn execute!
   "Queues the operation primitive `p` for execution in stream `strm`.
@@ -86,9 +91,7 @@
   Returns `strm`. Throws an ExceptionInfo if the DNNL stream is not valid,
   or the primitive cannot be executed."
   [strm p args]
-  (execute* (extract strm) (extract p) args)
-  strm)
-
+  (execute* (extract strm) (extract p) args))
 
 ;; ===================== Memory ===============================================
 
@@ -112,27 +115,34 @@
   (memory-desc [2 3 4 5] :float [120 3 4 5])
   "
   ([dims data-type format]
-   (memory-desc* (if (keyword? format)
-                   (enc-keyword dnnl-format format)
-                   (long-array (drop (- (count format) (count dims)) format)))
-                 (long-array dims) (enc-keyword dnnl-data-type data-type)))
+   (with-release [dims (long-pointer dims)
+                  fmt (if (keyword? format)
+                        (enc-keyword dnnl-format format)
+                        (long-pointer (drop (- (count format) (size dims)) format)))]
+
+     (->MemoryDescImpl (memory-desc* fmt (extract dims) (enc-keyword dnnl-data-type data-type)) true)))
   ([dims format]
    (memory-desc dims :float format))
   ([dims]
    (memory-desc dims :float :any))
   ([]
-   (dnnl_memory_desc_t.)))
+   (->MemoryDescImpl (dnnl_memory_desc.) true)))
 
 (defn submemory-desc
   "Creates a (sub)memory section of a memory object, using the specified
   shape `dims`, and `offsets` vectors."
   ([parent-desc dims offsets]
-   (submemory-desc* (desc parent-desc) (long-array dims) (long-array offsets)))
+   (with-release [dims (long-pointer dims)
+                  offsets (long-pointer offsets)]
+     (->MemoryDescImpl (submemory-desc* (extract (desc parent-desc)) (extract dims) (extract offsets)) true)))
   ([parent-desc dim]
-   (if (number? dim)
-     (submemory-desc* (desc parent-desc) dim)
-     (let [ds (long-array dim)]
-       (submemory-desc* (desc parent-desc) ds (long-array (alength ds)))))))
+   (->MemoryDescImpl
+    (if (number? dim)
+      (submemory-desc* (extract (desc parent-desc)) dim)
+      (with-release [dims (long-pointer dim)
+                     offsets (fill! (long-pointer (size dims)) 0)]
+        (submemory-desc* (extract (desc parent-desc)) (extract dims) (extract offsets))))
+    true)))
 
 (defn equal-desc?
   "Compares two memory descriptors for logical equality.
@@ -141,108 +151,113 @@
   equal nor identical in the JVM sense.
   "
   [x y]
-  (let [x (desc x)
-        y (desc y)]
+  (let [x (extract (desc x))
+        y (extract (desc y))]
     (or (= x y) (= 1 (dnnl/dnnl_memory_desc_equal x y)))))
 
 (def zero-desc (memory-desc [] :undef []))
 
 (defn zero-desc? [mem-desc]
-  (or (nil? mem-desc) (equal-desc? zero-desc mem-desc)))
+  (or (null? (extract mem-desc)) (equal-desc? zero-desc mem-desc)))
 
 (defn data-type
   "Queries the data type of a memory descriptor."
   [mem-desc]
-  (dec-data-type (data-type* (desc mem-desc))))
+  (dec-data-type (data-type* (extract (desc mem-desc)))))
 
 (defn ndims
   "Queries the number of dimensions of a memory descriptor."
   ^long [mem-desc]
-  (.ndims ^dnnl_memory_desc_t (desc mem-desc)))
+  (ndims* (extract (desc mem-desc))))
 
 (defn dims
   "Queries the dimensions of a memory descriptor."
   [mem-desc]
-  (vec (dims* (desc mem-desc))))
-
-(defn size
-  "Queries the mem-desc for its dimensions."
-  ^long [mem-desc]
-  (dnnl/dnnl_memory_desc_get_size (desc mem-desc)))
+  (with-release [res (dims* (extract (desc mem-desc)))]
+    (pointer-vec res)))
 
 (defn strides
   "Queries the strides of a memory descriptor."
   [mem-desc]
-  (vec (strides* (desc mem-desc))))
+  (try
+    (with-release [res (strides* (extract (desc mem-desc)))]
+      (pointer-vec res))
+    (catch ExceptionInfo e
+      (if (= :invalid-arguments (:error (ex-data e)))
+        (vec (long-array (ndims* (extract (desc mem-desc)))))))))
+
+(defmacro extend-memory-desc-info [t]
+  `(extend-type ~t
+     Info
+     (info
+       ([this# info-type#]
+        (case info-type#
+          :class (class this#)
+          :device :cpu
+          :shape (dims this#)
+          :data-type (data-type this#)
+          :strides (strides this#)
+          nil))
+       ([this#]
+        {:class (class this#)
+         :device :cpu
+         :shape (dims this#)
+         :data-type (data-type this#)
+         :strides (strides this#)}))))
+
+(extend-memory-desc-info MemoryDescImpl)
+(extend-memory-desc-info MemoryImpl)
 
 (defn memory
   "An engine-specific memory handle for a raw buffer and a matching descriptor.
 
   `eng` a DNNL engine that controls the context.
   `mem-desc` logical memory descriptor.
-  `buf` Java's DirectByteBuffer instance.
+  `buf` JavaCPP pointer instance.
   `master` indicates whether this memory object handles the life cycle of `buf`."
   ([eng mem-desc buf master]
-   (if (<= (size (desc mem-desc)) (capacity buf))
-     (memory* (desc mem-desc) (extract eng) buf master)
+   (if (<= (bytesize mem-desc) (bytesize buf))
+     (memory* (extract mem-desc) (extract eng) (safe buf) master)
      (dragan-says-ex "The buffer has to be large enough for mem-desc"
-                     {:size (size (desc mem-desc)) :capacity (capacity buf)})))
+                     {:desc-bytes (bytesize mem-desc) :buffer-bytes (bytesize buf)})))
   ([eng mem-desc buf]
    (memory eng mem-desc buf false))
   ([eng mem-desc]
-   (let-release [buf (direct-buffer (size (desc mem-desc)))]
-     (memory* (desc mem-desc) (extract eng) buf true))))
+   (if mem-desc
+     (let-release [buf (byte-pointer (bytesize mem-desc))]
+       (memory* (extract mem-desc)
+                eng
+                (safe (if-let [ptr-fn (type-pointer (data-type mem-desc))]
+                        (ptr-fn buf)
+                        buf))
+                true))
+     nil)))
 
 (defn offset!
   "Sets the starting position in the buffer that the memory object `mem` controls."
   [mem ^long n]
-  (let [p (ptr mem)]
-    (if (<= 0 n (.capacity ^Pointer p))
-      (with-check (dnnl/dnnl_memory_set_data_handle
-                   (extract mem) (.position ^Pointer p n))
+  (let [p (pointer mem)]
+    (if (<= 0 n (capacity p))
+      (with-check (dnnl/dnnl_memory_set_data_handle (extract mem) (byte-pointer (position! p n)))
         mem)
-      (dragan-says-ex "There is not enough capacity in the underlying buffer for this offset."
-                      {:n n :requested n :available (.capacity ^Pointer p)}))))
+      (dragan-says-ex "There isn't enough capacity in the underlying buffer for this offset."
+                      {:n n :requested n :available (size p)}))))
 
 (defn offset
   "Gets the starting position in the buffer that the memory object `mem` controls."
   ^long [mem]
-  (.position ^Pointer (ptr mem)))
+  (position (pointer mem)))
 
 (defn get-engine
   "Returns the engine context of the memory object `mem`."
   [mem]
-  (wrap (get-engine* (extract mem))))
+  (get-engine* (extract mem)))
 
 (defn dnnl-contiguous-desc [md]
   (let [s (dims md)]
-    (if (and (= :float (data-type md))
-             (= (size md) (apply * Float/BYTES s)))
-      (view md)
+    (if (and (= :float (data-type md)) (= (bytesize md) (apply * Float/BYTES s)))
+      (view (desc md))
       (memory-desc s :float (default-strides s)))))
-
-;; ===================== Desc =================================================
-
-(defn primitive-kind
-  "Queries `desc` for the kind of primitive that it describes, returned as
-  keyword.
-
-  Result is one of the keywords defined in [[constants/dec-primitive-kind]],
-  typically `:inner-product`, `:convolution`, `:elementwise`, etc."
-  [desc]
-  (dec-primitive-kind (primitive-kind* desc)))
-
-(defn primitive-desc
-  "Creates a primitive descriptor from the operation descriptor `desc`,
-  optionally using a hint provided by a complementary primitive descriptor
-  `hint-pd` (in case of backward propagation, for example), and additonal
-  optional attribute `attr`."
-  ([eng desc]
-   (wrap (primitive-desc* (extract eng) desc)))
-  ([eng desc hint-pd]
-   (wrap (primitive-desc* (extract eng) desc (extract hint-pd))))
-  ([eng desc hint-pd attr]
-   (wrap (primitive-desc* (extract eng) desc (extract hint-pd) (extract attr)))))
 
 ;; ===================== Primitive ============================================
 
@@ -262,7 +277,7 @@
   [the official DNNL guide](https://intel.github.io/mkl-dnn/dev_guide_basic_concepts.html).
   "
   [pd]
-  (wrap (primitive* (extract pd))))
+  (primitive* (extract pd)))
 
 ;; =================== Query ====================================================
 
@@ -270,63 +285,63 @@
   "Queries the primitive descriptor `pd` for the property `what` and (optional) index `index`."
   ([pd what index]
    (let [index (if (= :exec-arg-md what) (dnnl-arg index index))
-         d (query-md* (extract pd) (dnnl-query what what) index)]
+         d (->MemoryDescImpl (query-md* (extract pd) (dnnl-query what what) index) false)]
      (if (zero-desc? d) nil d)))
   ([pd what]
-   (let [d (query-md* (extract pd) (dnnl-query what what))]
+   (let [d (->MemoryDescImpl (query-md* (extract pd) (dnnl-query what what)) false)]
      (if (zero-desc? d) nil d))))
 
 (defn arg-md
   "Queries the primitive descriptor `pd` for the argument's memory descriptor."
   [pd arg]
-  (let [d (query-md* (extract pd) dnnl/dnnl_query_exec_arg_md (dnnl-arg arg arg))]
+  (let [d (->MemoryDescImpl (query-md* (extract pd) dnnl/dnnl_query_exec_arg_md (dnnl-arg arg arg)) false)]
     (if (zero-desc? d) nil d)))
 
 (defn src-md
   "Queries the primitive descriptor `pd` for the source (input)."
   [pd]
-  (let [d (query-md* (extract pd) dnnl/dnnl_query_src_md)]
+  (let [d (->MemoryDescImpl (query-md* (extract pd) dnnl/dnnl_query_src_md) false)]
     (if (zero-desc? d) nil d)))
 
 (defn diff-src-md
   "Queries the primitive descriptor `pd` for the gradient of the source (input)."
   [pd]
-  (let [d (query-md* (extract pd) dnnl/dnnl_query_diff_src_md)]
+  (let [d (->MemoryDescImpl (query-md* (extract pd) dnnl/dnnl_query_diff_src_md) false)]
     (if (zero-desc? d) nil d)))
 
 (defn weights-md
   "Queries the primitive descriptor `pd` for the weights."
   [pd]
-  (let [d (query-md* (extract pd) dnnl/dnnl_query_weights_md)]
+  (let [d (->MemoryDescImpl (query-md* (extract pd) dnnl/dnnl_query_weights_md) false)]
     (if (zero-desc? d) nil d)))
 
 (defn diff-weights-md
   "Queries the primitive descriptor `pd` for the gradient of the weights."
   [pd]
-  (let [d (query-md* (extract pd) dnnl/dnnl_query_diff_weights_md)]
+  (let [d (->MemoryDescImpl (query-md* (extract pd) dnnl/dnnl_query_diff_weights_md) false)]
     (if (zero-desc? d) nil d)))
 
 (defn dst-md
   "Queries the primitive descriptor `pd` for the destination (output)."
   [pd]
-  (let [d (query-md* (extract pd) dnnl/dnnl_query_dst_md)]
+  (let [d (->MemoryDescImpl (query-md* (extract pd) dnnl/dnnl_query_dst_md) false)]
     (if (zero-desc? d) nil d)))
 
 (defn diff-dst-md
   "Queries the primitive descriptor `pd` for the gradient of the destination (output)."
   [pd]
-  (let [d (query-md* (extract pd) dnnl/dnnl_query_diff_dst_md)]
+  (let [d (->MemoryDescImpl (query-md* (extract pd) dnnl/dnnl_query_diff_dst_md) false)]
     (if (zero-desc? d) nil d)))
 
 (defn workspace-md
   "Queries the primitive descriptor `pd` for the workspace (scratchpad)."
   [pd]
-  (let [d (query-md* (extract pd) dnnl/dnnl_query_workspace_md)]
+  (let [d (->MemoryDescImpl (query-md* (extract pd) dnnl/dnnl_query_workspace_md) false)]
     (if (zero-desc? d) nil d)))
 
 ;; =================== Etlwise ==================================================
 
-(defn eltwise-fwd-desc
+(defn eltwise-fwd
   "Creates a forward descriptor of an operation that is applied to
   every element of a tensor.
 
@@ -336,16 +351,16 @@
   (defined in `[[constants/dnnl-eltwise-alg-kind]]`)
   * `mem-desc`: the descriptor that defines memory layout of the data
   * `alpha`, and `beta`: optional coefficients, depending on `alg-kind`."
-  ([prop-kind alg-kind mem-desc alpha beta]
-   (eltwise-forward-desc* (enc-keyword dnnl-forward-prop-kind prop-kind)
-                          (enc-keyword dnnl-eltwise-alg-kind alg-kind)
-                          (desc mem-desc) alpha beta))
-  ([prop-kind alg-kind mem-desc]
-   (eltwise-forward-desc* (enc-keyword dnnl-forward-prop-kind prop-kind)
-                          (enc-keyword dnnl-eltwise-alg-kind alg-kind)
-                          (desc mem-desc) 0.0 0.0)))
+  ([eng prop-kind alg-kind mem-desc alpha beta]
+   (eltwise-forward* (extract eng) (enc-keyword dnnl-forward-prop-kind prop-kind)
+                     (enc-keyword dnnl-eltwise-alg-kind alg-kind)
+                     (extract mem-desc) alpha beta nil))
+  ([eng prop-kind alg-kind mem-desc]
+   (eltwise-forward* (extract eng) (enc-keyword dnnl-forward-prop-kind prop-kind)
+                     (enc-keyword dnnl-eltwise-alg-kind alg-kind)
+                     (extract mem-desc) 0.0 0.0 nil)))
 
-(defn eltwise-bwd-desc
+(defn eltwise-bwd
   "Creates a backward descriptor of an operation that is applied to
   every element of a tensor. Used only during the training.
 
@@ -355,12 +370,12 @@
   * `src-desc`: the source memory descriptor
   * `dst-desc`: the destination memory descriptor
   * `alpha`, and `beta`: optional coefficients, depending on `alg-kind`."
-  ([alg-kind diff-desc src-desc alpha beta]
-   (eltwise-backward-desc* (enc-keyword dnnl-eltwise-alg-kind alg-kind)
-                           (desc diff-desc) (desc src-desc) alpha beta))
-  ([alg-kind diff-desc src-desc]
-   (eltwise-backward-desc* (enc-keyword dnnl-eltwise-alg-kind alg-kind)
-                           (desc diff-desc) (desc src-desc) 0.0 0.0)))
+  ([eng hint-fwd-pd alg-kind diff-desc src-desc alpha beta]
+   (eltwise-backward* (extract eng) (enc-keyword dnnl-eltwise-alg-kind alg-kind)
+                      (extract diff-desc) (extract src-desc) alpha beta (extract hint-fwd-pd) nil))
+  ([eng hint-fwd-pd alg-kind diff-desc src-desc]
+   (eltwise-backward* (extract eng) (enc-keyword dnnl-eltwise-alg-kind alg-kind)
+                      (extract diff-desc) (extract src-desc) 0.0 0.0 (extract hint-fwd-pd) nil)))
 
 (defn eltwise-bwd-args
   "Creates DNNL's data structure that holds arguments as required by
@@ -398,30 +413,28 @@
   (sum eng md 2.0 md 3.0 md)
   "
   ([eng scale dst]
-   (wrap (sum* (desc dst) (float-array [scale]) (desc dst) (extract eng))))
+   (with-release [scale (float-pointer [scale])]
+     (sum* (extract eng) (extract dst) scale (extract dst) nil)))
   ([eng dst scale src & scale-srcs]
-   (let [srcs (mapv desc (cons src (take-nth 2 (rest scale-srcs))))
+   (let [srcs (mapv extract (cons src (take-nth 2 (rest scale-srcs))))
          n (count srcs)]
-     (let-release [s (dnnl_memory_desc_t. n)]
+     (with-release [s (pointer-pointer n)
+                    scale (float-pointer (cons scale (take-nth 2 scale-srcs)))]
        (dotimes [i n]
-         (.position s i)
-         (.put s (srcs i)))
-       (wrap (sum* (desc dst)
-                   (float-array (cons scale (take-nth 2 scale-srcs)))
-                   s (extract eng)))))))
+         (put-entry! s i (srcs i)))
+       (sum-pp* (extract eng) (extract dst) (extract scale) (extract s) nil)))))
 
-;; ======================= Sum ============================================================
+;; ======================= Binary op ============================================================
 
-(defn binary-desc
-  "TODO
-  NOTE: much slower than Neanderthal add or mul. Use only when can't avoid it."
-  ([alg-kind src0-desc src1-desc dst-desc]
-   (binary-desc* (enc-keyword dnnl-binary-alg-kind alg-kind)
-                 (desc src0-desc) (desc src1-desc) (desc dst-desc) ))
-  ([alg-kind src-dst-desc src1-desc]
-   (binary-desc alg-kind src-dst-desc src1-desc src-dst-desc))
-  ([alg-kind src-dst-desc]
-   (binary-desc alg-kind src-dst-desc src-dst-desc src-dst-desc)))
+(defn binary
+  "DNNL binary operation. NOTE: much slower than Neanderthal add or mul. Use only when can't avoid it."
+  ([eng alg-kind src0-desc src1-desc dst-desc]
+   (binary* (extract eng) (enc-keyword dnnl-binary-alg-kind alg-kind)
+            (extract src0-desc) (extract src1-desc) (extract dst-desc) nil))
+  ([eng alg-kind src-dst-desc src1-desc]
+   (binary eng alg-kind src-dst-desc src1-desc src-dst-desc))
+  ([eng alg-kind src-dst-desc]
+   (binary eng alg-kind src-dst-desc src-dst-desc src-dst-desc)))
 
 (defn binary-args
   ([src0 src1 dst]
@@ -510,13 +523,13 @@
   "Copies data across engines, between physical memory formats, keeping the
   logical structure of the tensor."
   ([input-eng input output-eng output]
-   (wrap (reorder* (desc input) (extract input-eng) (desc output) (extract output-eng))))
+   (reorder* (extract (desc input)) (extract input-eng) (extract (desc output)) (extract output-eng)))
   ([eng input output]
    (reorder eng input eng output)))
 
 ;; ======================== Inner Product =======================================
 
-(defn inner-product-fwd-desc
+(defn inner-product-fwd
   "Creates a descriptor for the forward phase of the inner product operation,
   which computes `dst <- src * weights + bias`.
 
@@ -527,12 +540,12 @@
   `bias-desc`: descriptor of the bias memory.
   `dst-desc`: descripror of the destination (output) memory.
   "
-  [prop-kind src-desc weights-desc bias-desc dst-desc]
-  (inner-product-forward-desc* (enc-keyword dnnl-forward-prop-kind prop-kind)
-                               (desc src-desc) (desc weights-desc)
-                               (desc bias-desc) (desc dst-desc)))
+  [eng prop-kind src-desc weights-desc bias-desc dst-desc]
+  (inner-product-forward* (extract eng) (enc-keyword dnnl-forward-prop-kind prop-kind)
+                          (extract src-desc) (extract weights-desc)
+                          (extract bias-desc) (extract dst-desc) nil))
 
-(defn inner-product-bwd-desc
+(defn inner-product-bwd
   "Creates a descriptor for the backward phase of the inner product operation,
   for data (3-arguments) weights (5-arguments) updates.
 
@@ -548,35 +561,37 @@
   `diff-bias-desc`: descriptor of the bias gradient memory.
   `diff-dst-desc`: descriptor of the destination gradient (output) memory.
   "
-  ([diff-src-desc weights-desc diff-dst-desc]
-   (inner-product-backward-data-desc* (desc diff-src-desc) (desc weights-desc) (desc diff-dst-desc)))
-  ([src-desc diff-weights-desc diff-bias-desc diff-dst-desc]
-   (inner-product-backward-weights-desc* (desc src-desc) (desc diff-weights-desc)
-                                         (desc diff-bias-desc) (desc diff-dst-desc))))
+  ([eng hint-fwd-pd diff-src-desc weights-desc diff-dst-desc]
+   (inner-product-backward-data* (extract eng) (extract diff-src-desc) (extract weights-desc)
+                                 (extract diff-dst-desc) (extract hint-fwd-pd) nil))
+  ([eng hint-fwd-pd src-desc diff-weights-desc diff-bias-desc diff-dst-desc]
+   (inner-product-backward-weights* (extract eng) (extract src-desc) (extract diff-weights-desc)
+                                    (extract diff-bias-desc) (extract diff-dst-desc)
+                                    (extract hint-fwd-pd) nil)))
 
 ;; ================= Softmax ====================================================
 
-(defn softmax-fwd-desc
+(defn softmax-fwd
   "TODO"
-  [prop-kind mem-desc axis]
-  (softmax-forward-desc* (enc-keyword dnnl-forward-prop-kind prop-kind)
-                         (desc mem-desc) axis))
+  [eng prop-kind alg-kind mem-desc axis]
+  (softmax-forward* (extract eng) (enc-keyword dnnl-forward-prop-kind prop-kind)
+                    (enc-keyword dnnl-softmax-alg-kind alg-kind) (extract mem-desc) axis nil))
 
-(defn softmax-bwd-desc
+(defn softmax-bwd
   "TODO"
-  [diff-desc src-desc axis]
-  (softmax-backward-desc* (desc diff-desc) (desc src-desc) axis))
+  [eng hint-fwd-pd alg-kind diff-desc src-desc axis]
+  (softmax-backward* (extract eng) (enc-keyword dnnl-softmax-alg-kind alg-kind)
+                     (extract diff-desc) (extract src-desc) axis (extract hint-fwd-pd) nil))
 
 (defn softmax-bwd-args
-  "Creates DNNL's data structure that holds arguments as required by
-  softmax operations."
+  "Creates DNNL's data structure that holds arguments as required by softmax fwd and bwd operations."
   ([dst diff-dst diff-src]
    (let-release [args (dnnl_exec_arg_t. 3)]
      (args* args 0 dnnl/DNNL_ARG_DST (extract dst))
      (args* args 1 dnnl/DNNL_ARG_DIFF_DST (extract diff-dst))
      (args* args 2 dnnl/DNNL_ARG_DIFF_SRC (extract diff-src))))
   ([src dst diff-dst diff-src]
-   (let-release [args (dnnl_exec_arg_t. 3)]
+   (let-release [args (dnnl_exec_arg_t. 4)]
      (args* args 0 dnnl/DNNL_ARG_DST (extract dst))
      (args* args 1 dnnl/DNNL_ARG_DIFF_DST (extract diff-dst))
      (args* args 2 dnnl/DNNL_ARG_DIFF_SRC (extract diff-src))
@@ -584,117 +599,111 @@
 
 ;; ====================== Convolution ===========================================
 
-(defn convolution-forward-desc
+(defn convolution-fwd
   "TODO"
-  ([prop-kind alg-kind src-desc weights-desc bias-desc dst-desc
-    strides padding-l padding-r]
-   (convolution-forward-desc* (enc-keyword dnnl-forward-prop-kind prop-kind)
-                              (enc-keyword dnnl-convolution-alg-kind alg-kind)
-                              (desc src-desc) (desc weights-desc) (desc bias-desc)
-                              (desc dst-desc) (long-array strides)
-                              (long-array padding-l) (long-array padding-r)))
-  ([prop-kind alg-kind src-desc weights-desc bias-desc dst-desc strides padding]
-   (convolution-forward-desc prop-kind alg-kind src-desc weights-desc bias-desc dst-desc
-                             strides padding padding)))
+  ([eng prop-kind alg-kind src-desc weights-desc bias-desc dst-desc strides dilates padding-l padding-r]
+   (with-release [strides (long-pointer strides)
+                  dilates (if dilates (long-pointer dilates)
+                              (fill! (long-pointer (size strides)) 0))
+                  padding-l (long-pointer padding-l)
+                  padding-r (long-pointer padding-r)]
+     (convolution-forward* (extract eng)
+                           (enc-keyword dnnl-forward-prop-kind prop-kind)
+                           (enc-keyword dnnl-convolution-alg-kind alg-kind)
+                           (extract src-desc) (extract weights-desc) (extract bias-desc)
+                           (extract dst-desc)
+                           (extract strides) (extract dilates) (extract padding-l) (extract padding-r)
+                           nil)))
+  ([eng prop-kind alg-kind src-desc weights-desc bias-desc dst-desc strides dilates padding]
+   (convolution-fwd eng prop-kind alg-kind src-desc weights-desc bias-desc dst-desc
+                    strides dilates padding padding))
+  ([eng prop-kind alg-kind src-desc weights-desc bias-desc dst-desc strides padding]
+   (convolution-fwd eng prop-kind alg-kind src-desc weights-desc bias-desc dst-desc
+                    strides nil padding padding)))
 
-(defn dilated-convolution-forward-desc
+(defn convolution-bwd-data
   "TODO"
-  ([prop-kind alg-kind src-desc weights-desc bias-desc dst-desc
-    strides dilations padding-l padding-r]
-   (dilated-convolution-forward-desc* (enc-keyword dnnl-forward-prop-kind prop-kind)
-                                      (enc-keyword dnnl-convolution-alg-kind alg-kind)
-                                      (desc src-desc) (desc weights-desc) (desc bias-desc)
-                                      (desc dst-desc)
-                                      (long-array strides) (long-array dilations)
-                                      (long-array padding-l) (long-array padding-r)))
-  ([prop-kind alg-kind src-desc weights-desc bias-desc dst-desc strides dilations padding]
-   (dilated-convolution-forward-desc prop-kind alg-kind src-desc weights-desc bias-desc dst-desc
-                                     strides dilations padding padding)))
+  ([eng hint-fwd-pd alg-kind diff-src-desc weights-desc diff-dst-desc
+    strides dilates padding-l padding-r]
+   (with-release [strides (long-pointer strides)
+                  dilates (if dilates (long-pointer dilates)
+                              (fill! (long-pointer (size strides)) 0))
+                  padding-l (long-pointer padding-l)
+                  padding-r (long-pointer padding-r)]
+     (convolution-backward-data* (extract eng)
+                                 (enc-keyword dnnl-convolution-alg-kind alg-kind)
+                                 (extract diff-src-desc) (extract weights-desc) (extract diff-dst-desc)
+                                 (extract strides) (extract dilates) (extract padding-l) (extract padding-r)
+                                 (extract hint-fwd-pd) nil)))
+  ([eng hint-fwd-pd alg-kind diff-src-desc weights-desc diff-dst-desc strides dilates padding]
+   (convolution-bwd-data eng hint-fwd-pd alg-kind diff-src-desc weights-desc diff-dst-desc
+                         strides dilates padding padding))
+  ([eng hint-fwd-pd alg-kind diff-src-desc weights-desc diff-dst-desc strides padding]
+   (convolution-bwd-data eng hint-fwd-pd alg-kind diff-src-desc weights-desc diff-dst-desc
+                         strides nil padding padding)))
 
-(defn convolution-fwd-desc
+(defn convolution-bwd-weights
   "TODO"
-  ([prop-kind alg-kind src-desc weights-desc bias-desc dst-desc
-    strides dilations padding-l padding-r]
-   (if (= 0 (apply max dilations))
-     (convolution-forward-desc prop-kind alg-kind src-desc weights-desc bias-desc dst-desc
-                               strides padding-l padding-r)
-     (dilated-convolution-forward-desc prop-kind alg-kind src-desc weights-desc bias-desc dst-desc
-                                       strides dilations padding-l padding-r)))
-  ([prop-kind alg-kind src-desc weights-desc bias-desc dst-desc strides dilations padding]
-   (convolution-fwd-desc prop-kind alg-kind src-desc weights-desc bias-desc dst-desc
-                         strides dilations padding padding)))
-
-(defn convolution-backward-desc
-  "TODO"
-  ([alg-kind diff-src-desc weights-desc diff-dst-desc strides padding-l padding-r]
-   (convolution-backward-data-desc* (enc-keyword dnnl-convolution-alg-kind alg-kind)
-                                    (desc diff-src-desc) (desc weights-desc) (desc diff-dst-desc)
-                                    (long-array strides)
-                                    (long-array padding-l) (long-array padding-r)))
-  ([alg-kind src-desc diff-weights-desc diff-bias-desc diff-dst-desc
-    strides padding-l padding-r]
-   (convolution-backward-weights-desc* (enc-keyword dnnl-convolution-alg-kind alg-kind)
-                                       (desc src-desc) (desc diff-weights-desc)
-                                       (desc diff-bias-desc) (desc diff-dst-desc)
-                                       (long-array strides)
-                                       (long-array padding-l) (long-array padding-r))))
-
-(defn dilated-convolution-backward-desc
-  "TODO"
-  ([alg-kind diff-src-desc weights-desc diff-dst-desc strides dilations padding-l padding-r]
-   (dilated-convolution-backward-data-desc* (enc-keyword dnnl-convolution-alg-kind alg-kind)
-                                            (desc diff-src-desc) (desc weights-desc)
-                                            (desc diff-dst-desc)
-                                            (long-array strides) (long-array dilations)
-                                            (long-array padding-l) (long-array padding-r)))
-  ([alg-kind src-desc diff-weights-desc diff-bias-desc diff-dst-desc
-    strides dilations padding-l padding-r]
-   (dilated-convolution-backward-weights-desc* (enc-keyword dnnl-convolution-alg-kind alg-kind)
-                                               (desc src-desc) (desc diff-weights-desc)
-                                               (desc diff-bias-desc) (desc diff-dst-desc)
-                                               (long-array strides) (long-array dilations)
-                                               (long-array padding-l) (long-array padding-r))))
-
-(defn convolution-bwd-desc
-  "TODO"
-  ([alg-kind diff-src-desc weights-desc diff-dst-desc strides dilations padding-l padding-r]
-   (if (or (nil? dilations) (= 0 (apply max dilations)))
-     (convolution-backward-desc alg-kind diff-src-desc weights-desc diff-dst-desc
-                                strides padding-l padding-r)
-     (dilated-convolution-backward-desc alg-kind diff-src-desc weights-desc diff-dst-desc
-                                        strides dilations padding-l padding-r)))
-  ([alg-kind src-desc diff-weights-desc diff-bias-desc diff-dst-desc
-    strides dilations padding-l padding-r]
-   (if (or (nil? dilations) (= 0 (apply max dilations)))
-     (convolution-backward-desc alg-kind
-                                src-desc diff-weights-desc diff-bias-desc diff-dst-desc
-                                strides padding-l padding-r)
-     (dilated-convolution-backward-desc alg-kind
-                                        src-desc diff-weights-desc diff-bias-desc diff-dst-desc
-                                        strides dilations dilations padding-l padding-r))))
+  ([eng hint-fwd-pd alg-kind src-desc diff-weights-desc diff-bias-desc diff-dst-desc
+    strides dilates padding-l padding-r]
+   (with-release [strides (long-pointer strides)
+                  dilates (if dilates (long-pointer dilates)
+                              (fill! (long-pointer (size strides)) 0))
+                  padding-l (long-pointer padding-l)
+                  padding-r (long-pointer padding-r)]
+     (convolution-backward-weights* (extract eng)
+                                    (enc-keyword dnnl-convolution-alg-kind alg-kind)
+                                    (extract src-desc) (extract diff-weights-desc)
+                                    (extract diff-bias-desc) (extract diff-dst-desc)
+                                    (extract strides) (extract dilates) (extract padding-l)
+                                    (extract padding-r) (extract hint-fwd-pd) nil)))
+  ([eng hint-fwd-pd alg-kind
+    src-desc diff-weights-desc diff-bias-desc diff-dst-desc strides dilates padding]
+   (convolution-bwd-weights eng hint-fwd-pd alg-kind src-desc diff-weights-desc diff-bias-desc
+                            diff-dst-desc strides dilates padding padding))
+  ([eng hint-fwd-pd alg-kind src-desc diff-weights-desc diff-bias-desc diff-dst-desc strides padding]
+   (convolution-bwd-weights eng hint-fwd-pd alg-kind
+                            src-desc diff-weights-desc diff-bias-desc diff-dst-desc
+                            strides nil padding padding)))
 
 ;; ====================== Pooling ===========================================
 
-(defn pooling-fwd-desc
+(defn pooling-fwd
   "TODO"
-  ([prop-kind alg-kind src-desc dst-desc kernel strides padding-l padding-r]
-   (pooling-forward-desc* (enc-keyword dnnl-forward-prop-kind prop-kind)
-                          (enc-keyword dnnl-pooling-alg-kind alg-kind)
-                          (desc src-desc) (desc dst-desc)
-                          (long-array strides) (long-array kernel)
-                          (long-array padding-l) (long-array padding-r)))
-  ([prop-kind alg-kind src-desc dst-desc kernel strides padding]
-   (pooling-fwd-desc prop-kind alg-kind src-desc dst-desc kernel strides padding padding)))
+  ([eng prop-kind alg-kind src-desc dst-desc kernel strides dilates padding-l padding-r]
+   (with-release [strides (long-pointer strides)
+                  kernel(long-pointer kernel)
+                  dilates (if dilates (long-pointer dilates)
+                              (fill! (long-pointer (size strides)) 0))
+                  padding-l (long-pointer padding-l)
+                  padding-r (long-pointer padding-r)]
+     (pooling-forward* (extract eng) (enc-keyword dnnl-forward-prop-kind prop-kind)
+                       (enc-keyword dnnl-pooling-alg-kind alg-kind)
+                       (extract src-desc) (extract dst-desc)
+                       strides kernel dilates padding-l padding-r nil)))
+  ([eng prop-kind alg-kind src-desc dst-desc kernel strides dilates padding]
+   (pooling-fwd eng prop-kind alg-kind src-desc dst-desc kernel strides dilates padding padding))
+  ([eng prop-kind alg-kind src-desc dst-desc kernel strides padding]
+   (pooling-fwd eng prop-kind alg-kind src-desc dst-desc kernel strides nil padding padding)))
 
-(defn pooling-bwd-desc
+(defn pooling-bwd
   "TODO"
-  ([alg-kind diff-src-desc diff-dst-desc kernel strides padding-l padding-r]
-   (pooling-backward-desc* (enc-keyword dnnl-pooling-alg-kind alg-kind)
-                           (desc diff-src-desc) (desc diff-dst-desc)
-                           (long-array strides) (long-array kernel)
-                           (long-array padding-l) (long-array padding-r)))
-  ([alg-kind diff-src-desc diff-dst-desc kernel strides padding]
-   (pooling-bwd-desc alg-kind diff-src-desc diff-dst-desc kernel strides padding padding)))
+  ([eng hint-fwd-pd alg-kind diff-src-desc diff-dst-desc kernel strides dilates padding-l padding-r]
+   (with-release [strides (long-pointer strides)
+                  kernel(long-pointer kernel)
+                  dilates (if dilates (long-pointer dilates)
+                              (fill! (long-pointer (size strides)) 0))
+                  padding-l (long-pointer padding-l)
+                  padding-r (long-pointer padding-r)]
+     (pooling-backward* (extract eng) (enc-keyword dnnl-pooling-alg-kind alg-kind)
+                        (extract diff-src-desc) (extract diff-dst-desc)
+                        strides kernel dilates padding-l padding-r (extract hint-fwd-pd) nil)))
+  ([eng hint-fwd-pd alg-kind diff-src-desc diff-dst-desc kernel strides dilates padding]
+   (pooling-bwd eng hint-fwd-pd alg-kind diff-src-desc diff-dst-desc
+                kernel strides dilates padding padding))
+  ([eng hint-fwd-pd alg-kind diff-src-desc diff-dst-desc kernel strides padding]
+   (pooling-bwd eng hint-fwd-pd alg-kind diff-src-desc diff-dst-desc
+                kernel strides nil padding padding)))
 
 (defn pooling-bwd-args
   "TODO"
@@ -707,19 +716,18 @@
 
 ;; ====================== Batch Normalization ===========================================
 
-(defn batch-norm-fwd-desc
+(defn batch-norm-fwd
   "TODO"
-  [prop-kind data-desc & flags]
-  (batch-normalization-forward-desc* (enc-keyword dnnl-forward-prop-kind prop-kind)
-                                     (desc data-desc) 1e-8
-                                     (mask dnnl-normalization-flags flags)))
+  [eng prop-kind data-desc & flags]
+  (batch-normalization-forward* (extract eng) (enc-keyword dnnl-forward-prop-kind prop-kind)
+                                (extract data-desc) 1e-8 (mask dnnl-normalization-flags flags) nil))
 
-(defn batch-norm-bwd-desc
+(defn batch-norm-bwd
   "TODO"
-  [prop-kind diff-data-desc data-desc & flags]
-  (batch-normalization-backward-desc* (enc-keyword dnnl-backward-prop-kind prop-kind)
-                                      (desc diff-data-desc) (desc data-desc)
-                                      1e-8 (mask dnnl-normalization-flags flags)))
+  [eng hint-fwd-pd prop-kind diff-data-desc data-desc & flags]
+  (batch-normalization-backward* (extract eng) (enc-keyword dnnl-backward-prop-kind prop-kind)
+                                 (extract diff-data-desc) (extract data-desc) 1e-8
+                                 (mask dnnl-normalization-flags flags) (extract hint-fwd-pd) nil))
 
 (defn batch-norm-fwd-args
   ([src-and-dst]
@@ -727,29 +735,35 @@
   ([src dst]
    (let-release [args (dnnl_exec_arg_t. 2)]
      (args* args 0 dnnl/DNNL_ARG_SRC (extract src))
-     (args* args 1 dnnl/DNNL_ARG_DST (extract dst))))
+     (args* args 1 dnnl/DNNL_ARG_DST (extract dst))
+     (.position args 0)))
   ([src dst mean variance]
    (let-release [args (dnnl_exec_arg_t. 4)]
      (args* args 0 dnnl/DNNL_ARG_SRC (extract src))
      (args* args 1 dnnl/DNNL_ARG_DST (extract dst))
      (args* args 2 dnnl/DNNL_ARG_MEAN (extract mean))
-     (args* args 3 dnnl/DNNL_ARG_VARIANCE (extract variance))))
-  ([src dst scaleshift]
-   (let-release [args (dnnl_exec_arg_t. 3)]
+     (args* args 3 dnnl/DNNL_ARG_VARIANCE (extract variance))
+     (.position args 0)))
+  ([src dst scale shift _]
+   (let-release [args (dnnl_exec_arg_t. 4)]
      (args* args 0 dnnl/DNNL_ARG_SRC (extract src))
      (args* args 1 dnnl/DNNL_ARG_DST (extract dst))
-     (args* args 2 dnnl/DNNL_ARG_SCALE_SHIFT (extract scaleshift))))
-  ([src dst scaleshift mean variance]
-   (batch-norm-fwd-args src dst scaleshift mean variance nil))
-  ([src dst scaleshift mean variance workspace]
-   (let-release [args (dnnl_exec_arg_t. (if workspace 6 5))]
+     (args* args 2 dnnl/DNNL_ARG_SCALE (extract scale))
+     (args* args 3 dnnl/DNNL_ARG_SHIFT (extract shift))
+     (.position args 0)))
+  ([src dst scale shift mean variance]
+   (batch-norm-fwd-args src dst scale shift mean variance nil))
+  ([src dst scale shift mean variance workspace]
+   (let-release [args (dnnl_exec_arg_t. (if workspace 7 6))]
      (when workspace
-       (args* args 5 dnnl/DNNL_ARG_WORKSPACE (extract workspace)))
+       (args* args 6 dnnl/DNNL_ARG_WORKSPACE (extract workspace)))
      (args* args 0 dnnl/DNNL_ARG_SRC (extract src))
      (args* args 1 dnnl/DNNL_ARG_DST (extract dst))
-     (args* args 2 dnnl/DNNL_ARG_SCALE_SHIFT (extract scaleshift))
-     (args* args 3 dnnl/DNNL_ARG_MEAN (extract mean))
-     (args* args 4 dnnl/DNNL_ARG_VARIANCE (extract variance)))))
+     (args* args 2 dnnl/DNNL_ARG_SCALE (extract scale))
+     (args* args 3 dnnl/DNNL_ARG_SHIFT (extract shift))
+     (args* args 4 dnnl/DNNL_ARG_MEAN (extract mean))
+     (args* args 5 dnnl/DNNL_ARG_VARIANCE (extract variance))
+     (.position args 0))))
 
 (defn batch-norm-bwd-args
   ([diff-dst src mean variance diff-src]
@@ -758,176 +772,165 @@
      (args* args 1 dnnl/DNNL_ARG_SRC (extract src))
      (args* args 2 dnnl/DNNL_ARG_MEAN (extract mean))
      (args* args 3 dnnl/DNNL_ARG_VARIANCE (extract variance))
-     (args* args 4 dnnl/DNNL_ARG_DIFF_SRC (extract diff-src))))
-  ([diff-dst src scaleshift mean variance diff-src diff-scaleshift]
-   (batch-norm-bwd-args diff-dst src scaleshift mean variance diff-src diff-scaleshift nil))
-  ([diff-dst src scaleshift mean variance diff-src diff-scaleshift workspace]
-   (let-release [args (dnnl_exec_arg_t. (if workspace 8 7))]
+     (args* args 4 dnnl/DNNL_ARG_DIFF_SRC (extract diff-src))
+     (.position args 0)))
+  ([diff-dst src scale shift mean variance diff-src diff-scale]
+   (batch-norm-bwd-args diff-dst src scale shift mean variance diff-src diff-scale nil))
+  ([diff-dst src scale shift mean variance diff-src diff-scale workspace]
+   (let-release [args (dnnl_exec_arg_t. (if workspace 10 9))]
      (when workspace
-       (args* args 7 dnnl/DNNL_ARG_WORKSPACE (extract workspace)))
+       (args* args 9 dnnl/DNNL_ARG_WORKSPACE (extract workspace)))
      (args* args 0 dnnl/DNNL_ARG_DIFF_DST (extract diff-dst))
      (args* args 1 dnnl/DNNL_ARG_SRC (extract src))
-     (args* args 2 dnnl/DNNL_ARG_SCALE_SHIFT (extract scaleshift))
-     (args* args 3 dnnl/DNNL_ARG_MEAN (extract mean))
-     (args* args 4 dnnl/DNNL_ARG_VARIANCE (extract variance))
-     (args* args 5 dnnl/DNNL_ARG_DIFF_SRC (extract diff-src))
-     (args* args 6 dnnl/DNNL_ARG_DIFF_SCALE_SHIFT (extract diff-scaleshift)))))
+     (args* args 2 dnnl/DNNL_ARG_SCALE (extract scale))
+     (args* args 3 dnnl/DNNL_ARG_SHIFT (extract shift))
+     (args* args 4 dnnl/DNNL_ARG_MEAN (extract mean))
+     (args* args 5 dnnl/DNNL_ARG_VARIANCE (extract variance))
+     (args* args 6 dnnl/DNNL_ARG_DIFF_SRC (extract diff-src))
+     (args* args 7 dnnl/DNNL_ARG_DIFF_SCALE (extract diff-scale))
+     (.position args 0))))
 
 ;; ======================= Reduction ========================================================
 
-(defn reduction-desc
+(defn reduction
   "TODO"
-  ([alg-kind src-desc dst-desc p epsilon]
-   (reduction-desc* (enc-keyword dnnl-reduction-alg-kind alg-kind)
-                    (desc src-desc) (desc dst-desc) p epsilon))
-  ([alg-kind src-desc dst-desc]
-   (reduction-desc* (enc-keyword dnnl-reduction-alg-kind alg-kind)
-                    (desc src-desc) (desc dst-desc) 0.0 0.0)))
+  ([eng alg-kind src dst p epsilon]
+   (reduction* (extract eng) (enc-keyword dnnl-reduction-alg-kind alg-kind)
+               (extract src) (extract dst) p epsilon nil))
+  ([eng alg-kind src dst]
+   (reduction* (extract eng) (enc-keyword dnnl-reduction-alg-kind alg-kind)
+               (extract src) (extract dst) 0.0 0.0 nil)))
 
 ;; ======================= Concat ============================================================
 
 (defn concatenate
   "TODO"
-  ([eng dst-desc concat-dimension & src-descs]
-   (let [srcs (mapv desc src-descs)
+  ([eng dst concat-dimension src]
+   (concat* (extract eng) (extract dst) concat-dimension (extract src) nil))
+  ([eng dst concat-dimension src & srcs]
+   (let [srcs (mapv extract (cons src srcs))
          n (count srcs)]
-     (let-release [s (dnnl_memory_desc_t. n)]
+     (with-release [s (pointer-pointer n)]
        (dotimes [i n]
-         (.position s i)
-         (.put s (srcs i)))
-       (wrap (concat* (desc dst-desc) n concat-dimension s nil (extract eng)))))))
+         (put-entry! s i (srcs i)))
+       (concat* (extract eng) (extract dst) n concat-dimension s nil)))))
 
 ;; ======================== RNN ==============================================================
 
-(defn vanilla-rnn-fwd-desc
+(defn vanilla-rnn-fwd
   "TODO"
-  ([prop-kind activation direction
-    src-desc src-iter-desc weights-desc weights-iter-desc bias-desc dst-desc dst-iter-desc alpha beta]
-   (vanilla-rnn-forward-desc* (enc-keyword dnnl-forward-prop-kind prop-kind)
-                              (enc-keyword dnnl-eltwise-alg-kind activation)
-                              (enc-keyword dnnl-direction direction)
-                              (desc src-desc) (desc src-iter-desc)
-                              (desc weights-desc) (desc weights-iter-desc) (desc bias-desc)
-                              (desc dst-desc) (desc dst-iter-desc) alpha beta))
-  ([prop-kind activation direction
+  ([eng prop-kind activation direction
     src-desc src-iter-desc weights-desc weights-iter-desc bias-desc dst-desc dst-iter-desc alpha]
-   (vanilla-rnn-fwd-desc prop-kind activation direction src-desc src-iter-desc
-                         weights-desc weights-iter-desc bias-desc dst-desc dst-iter-desc alpha 0.0))
-  ([prop-kind activation direction
+   (vanilla-rnn-forward* (extract eng) (enc-keyword dnnl-forward-prop-kind prop-kind)
+                         (enc-keyword dnnl-eltwise-alg-kind activation)
+                         (enc-keyword dnnl-direction direction)
+                         (extract src-desc) (extract src-iter-desc)
+                         (extract weights-desc) (extract weights-iter-desc) (extract bias-desc)
+                         (extract dst-desc) (extract dst-iter-desc) alpha nil))
+  ([eng prop-kind activation direction
     src-desc src-iter-desc weights-desc weights-iter-desc bias-desc dst-desc dst-iter-desc]
-   (vanilla-rnn-fwd-desc prop-kind activation direction src-desc src-iter-desc
-                         weights-desc weights-iter-desc bias-desc dst-desc dst-iter-desc 0.0 0.0)))
+   (vanilla-rnn-fwd eng prop-kind activation direction src-desc src-iter-desc
+                    weights-desc weights-iter-desc bias-desc dst-desc dst-iter-desc 0.0)))
 
-(defn vanilla-rnn-bwd-desc
+(defn vanilla-rnn-bwd
   "TODO"
-  ([activation direction
-    src-desc src-iter-desc weights-desc weights-iter-desc bias-desc dst-desc dst-iter-desc
-    diff-src-desc diff-src-iter-desc diff-weights-desc diff-weights-iter-desc diff-bias-desc
-    diff-dst-desc diff-dst-iter-desc alpha beta]
-   (vanilla-rnn-backward-desc* (enc-keyword dnnl-eltwise-alg-kind activation)
-                               (enc-keyword dnnl-direction direction)
-                               (desc src-desc) (desc src-iter-desc)
-                               (desc weights-desc) (desc weights-iter-desc) (desc bias-desc)
-                               (desc dst-desc) (desc dst-iter-desc)
-                               (desc diff-src-desc) (desc diff-src-iter-desc)
-                               (desc diff-weights-desc) (desc diff-weights-iter-desc) (desc diff-bias-desc)
-                               (desc diff-dst-desc) (desc diff-dst-iter-desc)
-                               alpha beta))
-  ([activation direction
+  ([eng hint-fwd-pd activation direction
     src-desc src-iter-desc weights-desc weights-iter-desc bias-desc dst-desc dst-iter-desc
     diff-src-desc diff-src-iter-desc diff-weights-desc diff-weights-iter-desc diff-bias-desc
     diff-dst-desc diff-dst-iter-desc alpha]
-   (vanilla-rnn-bwd-desc activation direction src-desc src-iter-desc
-                         weights-desc weights-iter-desc bias-desc dst-desc dst-iter-desc
-                         diff-src-desc diff-src-iter-desc
-                         diff-weights-desc diff-weights-iter-desc diff-bias-desc
-                         diff-dst-desc diff-dst-iter-desc
-                         alpha 0.0))
-  ([activation direction
+   (vanilla-rnn-backward* (extract eng) (enc-keyword dnnl-eltwise-alg-kind activation)
+                          (enc-keyword dnnl-direction direction)
+                          (extract src-desc) (extract src-iter-desc)
+                          (extract weights-desc) (extract weights-iter-desc) (extract bias-desc)
+                          (extract dst-desc) (extract dst-iter-desc)
+                          (extract diff-src-desc) (extract diff-src-iter-desc)
+                          (extract diff-weights-desc) (extract diff-weights-iter-desc) (extract diff-bias-desc)
+                          (extract diff-dst-desc) (extract diff-dst-iter-desc)
+                          alpha
+                          (extract hint-fwd-pd) nil))
+  ([eng hint-fwd-pd activation direction
     src-desc src-iter-desc weights-desc weights-iter-desc bias-desc dst-desc dst-iter-desc
     diff-src-desc diff-src-iter-desc diff-weights-desc diff-weights-iter-desc diff-bias-desc
     diff-dst-desc diff-dst-iter-desc]
-   (vanilla-rnn-bwd-desc activation direction src-desc src-iter-desc
-                         weights-desc weights-iter-desc bias-desc dst-desc dst-iter-desc
-                         diff-src-desc diff-src-iter-desc
-                         diff-weights-desc diff-weights-iter-desc diff-bias-desc
-                         diff-dst-desc diff-dst-iter-desc
-                         0.0 0.0)))
+   (vanilla-rnn-bwd eng hint-fwd-pd activation direction src-desc src-iter-desc
+                    weights-desc weights-iter-desc bias-desc dst-desc dst-iter-desc
+                    diff-src-desc diff-src-iter-desc
+                    diff-weights-desc diff-weights-iter-desc diff-bias-desc
+                    diff-dst-desc diff-dst-iter-desc
+                    0.0)))
 
 ;; ======================= LSTM ============================================================
 
-(defn lstm-fwd-desc
+(defn lstm-fwd
   "TODO"
-  ([prop-kind direction
-    src-desc src-iter-desc src-iter-c-desc weights-desc weights-iter-desc
+  ([eng prop-kind direction src-desc src-iter-desc src-iter-c-desc
+    weights-desc weights-iter-desc weights-peephole-desc weights-projection-desc
     bias-desc dst-desc dst-iter-desc dst-iter-c-desc]
-   (lstm-forward-desc* (enc-keyword dnnl-forward-prop-kind prop-kind)
-                       (enc-keyword dnnl-direction direction)
-                       (desc src-desc) (desc src-iter-desc) (desc src-iter-c-desc)
-                       (desc weights-desc) (desc weights-iter-desc) (desc bias-desc)
-                       (desc dst-desc) (desc dst-iter-desc) (desc dst-iter-c-desc)))
-  ([prop-kind direction
-    src-desc src-iter-desc weights-desc weights-iter-desc
-    bias-desc dst-desc dst-iter-desc]
-   (lstm-fwd-desc prop-kind direction
-                  src-desc src-iter-desc src-iter-desc weights-desc weights-iter-desc
-                  bias-desc dst-desc dst-iter-desc dst-iter-desc)))
+   (lstm-forward* (extract eng) (enc-keyword dnnl-forward-prop-kind prop-kind)
+                  (enc-keyword dnnl-direction direction)
+                  (extract src-desc) (extract src-iter-desc) (extract src-iter-c-desc)
+                  (extract weights-desc) (extract weights-iter-desc)
+                  (extract weights-peephole-desc) (extract weights-projection-desc) (extract bias-desc)
+                  (extract dst-desc) (extract dst-iter-desc) (extract dst-iter-c-desc) nil))
+  ([eng prop-kind direction src-desc src-iter-desc
+    weights-desc weights-iter-desc bias-desc dst-desc dst-iter-desc]
+   (lstm-fwd eng prop-kind direction src-desc src-iter-desc src-iter-desc
+             weights-desc weights-iter-desc nil nil bias-desc dst-desc dst-iter-desc dst-iter-desc)))
 
-(defn lstm-bwd-desc
+(defn lstm-bwd
   "TODO"
-  ([direction
-    src-desc src-iter-desc src-iter-c-desc
-    weights-desc weights-iter-desc bias-desc
+  ([eng hint-fwd-pd direction src-desc src-iter-desc src-iter-c-desc
+    weights-iter-peephole-projection bias-desc
     dst-desc dst-iter-desc dst-iter-c-desc
     diff-src-desc diff-src-iter-desc diff-src-iter-c-desc
-    diff-weights-desc diff-weights-iter-desc diff-bias-desc
+    diff-weights-iter-peephole-projection diff-bias-desc
     diff-dst-desc diff-dst-iter-desc diff-dst-iter-c-desc]
-   (lstm-backward-desc* (enc-keyword dnnl-direction direction)
-                        (desc src-desc) (desc src-iter-desc) (desc src-iter-c-desc)
-                        (desc weights-desc) (desc weights-iter-desc) (desc bias-desc)
-                        (desc dst-desc) (desc dst-iter-desc) (desc dst-iter-c-desc)
-                        (desc diff-src-desc) (desc diff-src-iter-desc) (desc diff-src-iter-c-desc)
-                        (desc diff-weights-desc) (desc diff-weights-iter-desc) (desc diff-bias-desc)
-                        (desc diff-dst-desc) (desc diff-dst-iter-desc) (desc diff-dst-iter-c-desc)))
-  ([direction
-    src-desc src-iter-desc
+   (lstm-backward* (extract eng) (enc-keyword dnnl-direction direction)
+                   (extract src-desc) (extract src-iter-desc) (extract src-iter-c-desc)
+                   (mapv extract weights-iter-peephole-projection) (extract bias-desc)
+                   (extract dst-desc) (extract dst-iter-desc) (extract dst-iter-c-desc)
+                   (extract diff-src-desc) (extract diff-src-iter-desc) (extract diff-src-iter-c-desc)
+                   (mapv extract diff-weights-iter-peephole-projection) (extract diff-bias-desc)
+                   (extract diff-dst-desc) (extract diff-dst-iter-desc) (extract diff-dst-iter-c-desc)
+                   (extract hint-fwd-pd) nil))
+  ([eng hint-fwd-pd direction src-desc src-iter-desc
     weights-desc weights-iter-desc bias-desc
     dst-desc dst-iter-desc
     diff-src-desc diff-src-iter-desc
     diff-weights-desc diff-weights-iter-desc diff-bias-desc
     diff-dst-desc diff-dst-iter-desc]
-   (lstm-bwd-desc direction
-                  src-desc src-iter-desc src-iter-desc weights-desc weights-iter-desc bias-desc
-                  dst-desc dst-iter-desc dst-iter-desc
-                  diff-src-desc diff-src-iter-desc diff-src-iter-desc
-                  diff-weights-desc diff-weights-iter-desc diff-bias-desc
-                  diff-dst-desc diff-dst-iter-desc diff-dst-iter-desc)))
+   (lstm-bwd eng hint-fwd-pd direction src-desc src-iter-desc src-iter-desc
+             [weights-desc weights-iter-desc nil nil] bias-desc
+             dst-desc dst-iter-desc dst-iter-desc
+             diff-src-desc diff-src-iter-desc diff-src-iter-desc
+             [diff-weights-desc diff-weights-iter-desc nil nil] diff-bias-desc
+             diff-dst-desc diff-dst-iter-desc diff-dst-iter-desc)))
 
 ;; ================================= GRU ====================================================
 
-(defn gru-fwd-desc
+(defn gru-fwd
   "TODO"
-  [prop-kind direction
+  [eng prop-kind direction
    src-desc src-iter-desc weights-desc weights-iter-desc
    bias-desc dst-desc dst-iter-desc]
-  (gru-forward-desc* (enc-keyword dnnl-forward-prop-kind prop-kind)
-                     (enc-keyword dnnl-direction direction)
-                     (desc src-desc) (desc src-iter-desc)
-                     (desc weights-desc) (desc weights-iter-desc) (desc bias-desc)
-                     (desc dst-desc) (desc dst-iter-desc)))
+  (gru-forward* (extract eng) (enc-keyword dnnl-forward-prop-kind prop-kind)
+                (enc-keyword dnnl-direction direction)
+                (extract src-desc) (extract src-iter-desc)
+                (extract weights-desc) (extract weights-iter-desc) (extract bias-desc)
+                (extract dst-desc) (extract dst-iter-desc) nil))
 
-(defn gru-bwd-desc
+(defn gru-bwd
   "TODO"
-  [direction
+  [eng hint-fwd-pd direction
    src-desc src-iter-desc weights-desc weights-iter-desc bias-desc
    dst-desc dst-iter-desc
    diff-src-desc diff-src-iter-desc
    diff-weights-desc diff-weights-iter-desc diff-bias-desc
    diff-dst-desc diff-dst-iter-desc]
-  (gru-backward-desc* (enc-keyword dnnl-direction direction)
-                      (desc src-desc) (desc src-iter-desc)
-                      (desc weights-desc) (desc weights-iter-desc) (desc bias-desc)
-                      (desc dst-desc) (desc dst-iter-desc)
-                      (desc diff-src-desc) (desc diff-src-iter-desc)
-                      (desc diff-weights-desc) (desc diff-weights-iter-desc) (desc diff-bias-desc)
-                      (desc diff-dst-desc) (desc diff-dst-iter-desc)))
+  (gru-backward* (extract eng) (enc-keyword dnnl-direction direction)
+                 (extract src-desc) (extract src-iter-desc)
+                 (extract weights-desc) (extract weights-iter-desc) (extract bias-desc)
+                 (extract dst-desc) (extract dst-iter-desc)
+                 (extract diff-src-desc) (extract diff-src-iter-desc)
+                 (extract diff-weights-desc) (extract diff-weights-iter-desc) (extract diff-bias-desc)
+                 (extract diff-dst-desc) (extract diff-dst-iter-desc) (extract hint-fwd-pd) nil))

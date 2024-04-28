@@ -8,24 +8,11 @@
 
 (ns uncomplicate.diamond.internal.dnnl.protocols)
 
-(defprotocol PointerCreator
-  (pointer [this]))
-
-(defprotocol DnnlCloneable
-  (clone [this]))
-
 (defprotocol BlockedDesc
   (memory-desc* [this dims data-type]))
 
-(defprotocol Memory
-  (data [this])
-  (ptr [this]))
-
 (defprotocol DescProvider
   (desc [this]))
-
-(defprotocol PrimitiveKind
-  (primitive-kind* [this]))
 
 (defprotocol DnnlEngineProvider
   (dnnl-engine [_]))

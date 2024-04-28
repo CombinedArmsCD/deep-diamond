@@ -8,33 +8,25 @@
 
 (ns uncomplicate.diamond.internal.utils
   (:require [uncomplicate.commons
-             [core :refer [Wrapper Releaseable with-release extract]]
+             [core :refer [Releaseable with-release]]
              [utils :refer [dragan-says-ex with-check]]]
-            [uncomplicate.fluokitten.core :refer [foldmap]]
+            [uncomplicate.fluokitten.core :refer [foldmap extract]]
+            [uncomplicate.clojure-cpp :refer [null?]]
             [uncomplicate.neanderthal.core :refer [transfer! axpy entry!]]
             [uncomplicate.diamond.internal.protocols
              :refer [weights bias weights-layer weights-iter bias-layer bias-iter]])
   (:import uncomplicate.neanderthal.internal.api.Block))
 
-(defmacro deftype-wrapper [name release-method error]
+(defmacro extend-pointer [name release-method error]
   (let [name-str (str name)]
-    `(deftype ~name [ref#]
-       Object
-       (hashCode [this#]
-         (hash (deref ref#)))
-       (equals [this# other#]
-         (= (deref ref#) (extract other#)))
-       (toString [this#]
-         (format "#%s[%s]" ~name-str (deref ref#)))
-       Wrapper
-       (extract [this#]
-         (deref ref#))
+    `(extend-type ~name
        Releaseable
        (release [this#]
-         (locking ref#
-           (when-let [d# (deref ref#)]
-             (locking d#
-               (with-check ~error (~release-method d#) (vreset! ref# nil)))))
+         (locking this#
+           (when-not (null? this#)
+             (with-check ~error (~release-method this#)
+               (do (.deallocate this#)
+                   (.setNull this#)))))
          true))))
 
 (defn check-contiguous
@@ -49,7 +41,12 @@ Please use a copy or create a transformer."
   ([^Block x ^Block y ^Block z]
    (check-contiguous x)
    (check-contiguous y)
-   (check-contiguous z)))
+   (check-contiguous z))
+  ([^Block x ^Block y ^Block z ^Block w]
+   (check-contiguous x)
+   (check-contiguous y)
+   (check-contiguous z)
+   (check-contiguous w)))
 
 (defn default-strides [shape]
   (let [cnt (count shape)]

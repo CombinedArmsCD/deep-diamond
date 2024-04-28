@@ -8,19 +8,20 @@
 
 (ns uncomplicate.diamond.internal.dnnl.tensor
   (:require [uncomplicate.commons
-             [core :refer [Releaseable release let-release with-release Info info Viewable view]]
+             [core :refer [Releaseable release let-release with-release Info info Viewable view
+                           bytesize size]]
              [utils :refer [dragan-says-ex]]]
-            [uncomplicate.fluokitten
-             [protocols :refer [Magma Monoid Applicative Functor]]
-             [core :refer [fmap foldmap]]]
+            [uncomplicate.fluokitten.protocols
+             :refer [Magma Monoid Applicative Functor Foldable Comonad extract fold foldmap]]
+            [uncomplicate.clojure-cpp :refer [pointer get-entry]]
             [uncomplicate.neanderthal
              [core :refer [transfer! dim copy!]]
-             [block :refer [entry-width data-accessor buffer count-entries contiguous?]]]
+             [block :refer [entry-width data-accessor buffer contiguous?]]]
             [uncomplicate.neanderthal.internal.api
              :refer [flow FactoryProvider EngineProvider DataAccessorProvider
                      Container raw copy MemoryContext set-all compatible? factory native-factory
                      create-vector DenseContainer view-vctr]]
-            [uncomplicate.neanderthal.internal.host.buffer-block :refer [real-block-vector]]
+            [uncomplicate.neanderthal.internal.cpp.structures :refer [real-block-vector]]
             [uncomplicate.diamond.tensor
              :refer [TensorDescriptor shape layout TensorContainer Transfer input output
                      Revert ConnectorCreator connector view-tz transformer batch-size]
@@ -28,28 +29,28 @@
             [uncomplicate.diamond.internal
              [protocols
               :refer [TensorFactory DiamondFactoryProvider diamond-factory create-tensor
-                      neanderthal-factory tensor-engine native-diamond-factory Offset
+                      neanderthal-factory tensor-engine native-diamond-factory Offset offset
                       DiffTransfer diff-input diff-output create-tensor-desc parameters
                       DescriptorProvider BatchDescriptor batch-index]]
              [utils :refer [check-contiguous]]]
             [uncomplicate.diamond.internal.dnnl
-             [core :refer [memory-desc dims data-type memory size strides submemory-desc
+             [core :refer [memory-desc dims data-type memory strides submemory-desc
                            equal-desc? execute! reorder primitive fwd-args offset! ndims]
               :as dnnl-core]
              [constants :refer [entry-bytes]]
-             [protocols :refer [DescProvider desc data ptr dnnl-engine]]])
+             [protocols :refer [DescProvider desc dnnl-engine]]])
   (:import org.bytedeco.javacpp.Pointer
            [clojure.lang Seqable IFn AFn]
-           [uncomplicate.neanderthal.internal.api Block VectorSpace Changeable]
-           org.bytedeco.dnnl.dnnl_memory_desc_t
-           uncomplicate.diamond.tensor.TensorDescriptorImpl))
+           [uncomplicate.neanderthal.internal.api Block VectorSpace Changeable Vector]
+           uncomplicate.diamond.tensor.TensorDescriptorImpl
+           uncomplicate.diamond.internal.dnnl.impl.MemoryDescImpl))
 
 (declare ->DnnlTensor dnnl-transformer dnnl-tensor dnnl-batcher ->DnnlShuffler)
 
 (extend-type java.util.Collection
   DescProvider
   (desc [this]
-    (memory-desc this :float :any)))
+    (memory-desc (shape this) :float :any)))
 
 (extend-type java.lang.Number
   DescProvider
@@ -71,11 +72,11 @@
   (desc [this]
     (memory-desc (shape this) (or (tz/data-type this) :float) (or (layout this) :any))))
 
-(extend-type dnnl_memory_desc_t
+(extend-type MemoryDescImpl
   TensorDescriptor
   (shape [this]
     (dims this))
-  (tz/data-type [this]
+  (data-type [this]
     (data-type this))
   (layout [this]
     (strides this))
@@ -90,8 +91,8 @@
             (let-release [in-tz (dnnl-tensor fact in-desc (batch-index out-tz))]
               (dnnl-transformer (dnnl-engine fact) (flow fact) in-tz (view out-tz)))))))))
 
-(defmethod print-method dnnl_memory_desc_t
-  [^dnnl_memory_desc_t d ^java.io.Writer w]
+(defmethod print-method MemoryDescImpl
+  [d ^java.io.Writer w]
   (.write w (pr-str {:shape (dims d) :data-type (data-type d) :layout (strides d)})))
 
 ;; =================== Transformer ==============================================
@@ -143,16 +144,15 @@
 (defn dnnl-transformer [eng strm in-tz out-tz]
   (with-release [reorder-pd (reorder eng in-tz out-tz)]
     (let-release [reorder-prim (primitive reorder-pd)]
-      (->DnnlTransformer eng strm reorder-prim
-                         (fwd-args (buffer in-tz) (buffer out-tz))
+      (->DnnlTransformer eng strm reorder-prim (fwd-args in-tz out-tz)
                          in-tz out-tz))))
 
 ;; =================== Batcher ==================================================
 
 (deftype DnnlBatcher [eng strm reorder reorder-args
                       src-sub dst-sub src-tz dst-tz ^long mb-size
-                      ^long src-cnt ^long src-stride-n ^long src-entry-width
-                      ^long dst-cnt ^long dst-stride-n ^long dst-entry-width]
+                      ^long src-cnt ^long src-stride-n
+                      ^long dst-cnt ^long dst-stride-n]
   Releaseable
   (release [_]
     (release src-tz)
@@ -194,8 +194,8 @@
           dst-n (long dst-n)]
       (if (and (<= 0 src-n (- src-cnt mb-size)) (<= 0 dst-n (- dst-cnt mb-size)))
         (do
-          (offset! src-sub (* src-entry-width src-stride-n src-n))
-          (offset! dst-sub (* dst-entry-width dst-stride-n dst-n))
+          (offset src-sub (* src-stride-n src-n))
+          (offset dst-sub (* dst-stride-n dst-n))
           (execute! strm2 reorder reorder-args))
         (dragan-says-ex "Requested subtensor is outside of bounds."
                         {:src-index src-n :src-cnt src-cnt
@@ -216,15 +216,10 @@
                   dst-sub (view-tz dst-tz mb-size)]
       (with-release [reorder-pd (reorder eng src-sub dst-sub)]
         (let-release [reorder-prim (primitive reorder-pd)]
-          (->DnnlBatcher eng strm reorder-prim
-                         (fwd-args (buffer src-sub) (buffer dst-sub))
-                         (buffer src-sub) (buffer dst-sub)
-                         src-tz dst-tz
-                         mb-size
+          (->DnnlBatcher eng strm reorder-prim (fwd-args src-sub dst-sub)
+                         src-sub dst-sub src-tz dst-tz mb-size
                          ((dims src-tz) (batch-index src-tz)) ((strides src-sub) (batch-index src-tz))
-                         (entry-bytes (data-type src-tz))
-                         ((dims dst-tz) (batch-index dst-tz)) ((strides dst-sub) (batch-index dst-tz))
-                         (entry-bytes (data-type dst-tz))))))))
+                         ((dims dst-tz) (batch-index dst-tz)) ((strides dst-sub) (batch-index dst-tz))))))))
 
 (deftype DnnlShuffler [strm batcher batch-size mb-size]
   Releaseable
@@ -255,7 +250,6 @@
     (dotimes [i mb-size]
       (batcher strm (rand-int batch-size) i))
     (output batcher))
-  IFn
   (invoke [this cols]
     (.invoke this strm cols))
   (invoke [_ strm2 cols]
@@ -286,6 +280,7 @@
   (equals [x y]
     (or (identical? x y)
         (and (instance? DnnlTensor y) (equal-desc? tz-mem (desc y))
+             (= (strides tz-mem) (layout y))
              (.isContiguous x) (.isContiguous ^DnnlTensor y)
              (= (view-vctr x) (view-vctr y)))))
   (toString [this]
@@ -297,7 +292,6 @@
      :device :cpu
      :shape (shape x)
      :strides (strides tz-mem)
-     :offset (dnnl-core/offset tz-mem)
      :master master
      :engine eng})
   (info [x info-type]
@@ -307,7 +301,6 @@
       :device :cpu
       :shape (shape x)
       :strides (strides tz-mem)
-      :offset (dnnl-core/offset tz-mem)
       :master master
       :engine eng
       nil))
@@ -316,6 +309,9 @@
     (if master
       (release tz-mem)
       true))
+  Comonad
+  (extract [_]
+    (extract tz-mem))
   EngineProvider
   (engine [_]
     eng)
@@ -337,12 +333,16 @@
     (dnnl-tensor diamond-fact tz-mem n-index))
   (raw [_ fact]
     (let [df (diamond-factory fact)]
-      (create-tensor df (create-tensor-desc df (desc tz-mem)) n-index false)))
+      (create-tensor df
+                     (create-tensor-desc df (dims tz-mem) (data-type tz-mem) (strides tz-mem))
+                     n-index false)))
   (zero [x]
     (dnnl-tensor diamond-fact tz-mem n-index))
   (zero [_ fact]
     (let [df (diamond-factory fact)]
-      (create-tensor df (create-tensor-desc df (desc tz-mem)) n-index true)))
+      (create-tensor df
+                     (create-tensor-desc df (dims tz-mem) (data-type tz-mem) (strides tz-mem))
+                     n-index true)))
   (host [x]
     (let-release [res (raw x)]
       (copy eng x res)))
@@ -360,36 +360,87 @@
     :cpu)
   Monoid
   (id [_]
-    (dnnl-tensor diamond-fact
-                 (memory-desc (repeat (ndims tz-mem) 0)
-                              (data-type tz-mem)
-                              (repeat (ndims tz-mem) 0))
-                 n-index))
+    (with-release [md (memory-desc (repeat (ndims tz-mem) 0)
+                                   (data-type tz-mem)
+                                   (repeat (ndims tz-mem) 0))]
+      (dnnl-tensor diamond-fact md n-index)))
   Functor
   (fmap [x f]
     (f x))
   (fmap [x f xs]
     (apply f x xs))
+  Foldable
+  (fold [this]
+    (check-contiguous this)
+    (fold (view-vctr this)))
+  (fold [this f init]
+    (check-contiguous this)
+    (fold (view-vctr this) f init))
+  (fold [this f init y]
+    (check-contiguous this y)
+    (fold (view-vctr this) f init (view-vctr y)))
+  (fold [this f init y z]
+    (check-contiguous this y z)
+    (fold (view-vctr this) f init (view-vctr y) (view-vctr z)))
+  (fold [this f init y z v]
+    (check-contiguous this y z v)
+    (fold (view-vctr this) f init (view-vctr y) (view-vctr z) (view-vctr v)))
+  (fold [this f init y z v ws]
+    (check-contiguous this y z v)
+    (doseq [w ws] (check-contiguous w))
+    (fold (view-vctr this) f (view-vctr y) (view-vctr z) (view-vctr v) (map view-vctr ws)))
+  (foldmap [this g]
+    (check-contiguous this)
+    (foldmap (view-vctr this) g))
+  (foldmap [this g f init]
+    (check-contiguous this)
+    (foldmap (view-vctr this) g f init))
+  (foldmap [this g f init y]
+    (check-contiguous this y)
+    (foldmap (view-vctr this) f init (view-vctr y)))
+  (foldmap [this g f init y z]
+    (check-contiguous this y z)
+    (foldmap (view-vctr this) g f init (view-vctr y) (view-vctr z)))
+  (foldmap [this g f init y z v]
+    (check-contiguous this y z v)
+    (foldmap (view-vctr this) g f init (view-vctr y) (view-vctr z) (view-vctr v)))
+  (foldmap [this g f init y z v ws]
+    (check-contiguous this y z v)
+    (doseq [w ws] (check-contiguous w))
+    (foldmap (view-vctr this) g f (view-vctr y) (view-vctr z) (view-vctr v) (map view-vctr ws)))
   Applicative
   (pure [x v]
-    (let-release [res (dnnl-tensor diamond-fact
-                                   (memory-desc (repeat (ndims tz-mem) 1)
-                                                (data-type tz-mem)
-                                                (repeat (ndims tz-mem) 1))
-                                   n-index)]
-      (set-all eng v x)))
+    (with-release [md (memory-desc (repeat (ndims tz-mem) 1)
+                                   (data-type tz-mem)
+                                   (repeat (ndims tz-mem) 1))]
+      (let-release [res (dnnl-tensor diamond-fact md n-index)]
+        (set-all eng v x))))
   (pure [x v vs]
     (let [vs (cons v vs)]
-      (let-release [res (dnnl-tensor diamond-fact
-                                     (memory-desc (cons (count vs) (repeat (dec (ndims tz-mem)) 1))
-                                                  (data-type tz-mem) (repeat (ndims tz-mem) 1))
-                                     n-index)]
-        (transfer! vs res))))
+      (with-release [md (memory-desc (cons (count vs) (repeat (dec (ndims tz-mem)) 1))
+                                     (data-type tz-mem) (repeat (ndims tz-mem) 1))]
+        (let-release [res (dnnl-tensor diamond-fact md n-index)]
+          (transfer! vs res)))))
+  VectorSpace
+  (dim [_]
+    (* n c))
+  Vector
+  (boxedEntry [_ i]
+    (get-entry (pointer tz-mem) i))
+  Block
+  (buffer [_]
+    (pointer tz-mem))
+  (offset [_]
+    0)
+  (stride [_]
+    1)
+  (isContiguous [_]
+    (= (size tz-mem) (apply * (dims tz-mem)) ))
   Changeable
   (setBoxed [x v]
     (set-all eng v x)
     x)
-  (setBoxed [x i val]
+  (setBoxed [_ _ _]
     (dragan-says-ex "Tensors do not support editing of specific entries. Please use tensor's vector view."))
   (alter [x f]
     (check-contiguous x)
@@ -399,19 +450,6 @@
     (check-contiguous x)
     (alter (view-vctr x) i f)
     x)
-  VectorSpace
-  (dim [_]
-    (* n c))
-  Block
-  (buffer [_]
-    tz-mem)
-  (offset [_]
-    (quot (dnnl-core/offset tz-mem) (entry-width (data-accessor neand-fact))))
-  (stride [_]
-    (dragan-says-ex "Tensors do not have a single stride. You're doing something wrong."))
-  (isContiguous [_]
-    (= (size tz-mem)
-       (apply * (entry-width (data-accessor neand-fact)) (dims tz-mem)) ))
   Revert
   (revert [this]
     this)
@@ -455,37 +493,34 @@
     (->DnnlTensor diamond-fact neand-fact eng false tz-mem n c n-index))
   DenseContainer
   (view-vctr [this]
-    (let [ewidth (entry-width (data-accessor neand-fact))]
-      (if (= (* (dim this) ewidth) (size tz-mem))
-        (create-vector neand-fact false (data tz-mem) (dim this)
-                       (/ (.position ^Pointer (ptr tz-mem)) ewidth) 1)
-        (dragan-says-ex "Strided tensors cannot be viewed as vectors."
-                        {:tensor (info this)}))))
+    (if (<= (dim this) (size tz-mem))
+      (create-vector neand-fact false (pointer tz-mem 0) (dim this) 0 1)
+      (dragan-says-ex "Strided tensors cannot be viewed as vectors."
+                      {:tensor (info this) :dim (dim this) :size (size tz-mem)})))
   TensorContainer
   (view-tz [this]
     this)
   (view-tz [_ sub]
-    (let-release [sub-desc (if (number? sub)
-                             (if (= 0 n-index)
-                               (submemory-desc tz-mem sub)
-                               (submemory-desc tz-mem (assoc (dims tz-mem) n-index sub)))
-                             (memory-desc (shape sub) (or (tz/data-type sub) (data-type tz-mem))
-                                          (or (layout sub) (strides tz-mem))))
-                  sub-mem (memory (dnnl-engine diamond-fact) sub-desc (data tz-mem) false)
-                  shp (dims sub-mem)]
-      (->DnnlTensor diamond-fact neand-fact eng false sub-mem (first shp) (apply * (rest shp))
-                    (if (= (count shp) (count (dims tz-mem))) n-index 0))))
+    (with-release [sub-desc (if (number? sub)
+                              (if (= 0 n-index)
+                                (submemory-desc tz-mem sub)
+                                (submemory-desc tz-mem (assoc (dims tz-mem) n-index sub)))
+                              (memory-desc (shape sub) (or (tz/data-type sub) (data-type tz-mem))
+                                           (or (layout sub) (strides tz-mem))))]
+      (let-release [sub-mem (memory (dnnl-engine diamond-fact) sub-desc (pointer tz-mem 0) false)
+                    shp (dims sub-mem)]
+        (->DnnlTensor diamond-fact neand-fact eng false sub-mem (first shp) (apply * (rest shp))
+                      (if (= (count shp) (count (dims tz-mem))) n-index 0)))))
   Offset
   (offset [this ofst]
-    (offset! tz-mem (* (long ofst) (entry-width (data-accessor neand-fact))))
+    (offset! tz-mem ofst)
     this)
   ConnectorCreator
   (connector [in-tz out-desc]
     (if (equal-desc? tz-mem out-desc)
       (view in-tz)
       (let-release [out-tz (dnnl-tensor diamond-fact neand-fact eng out-desc (batch-index in-tz))]
-        (dnnl-transformer (dnnl-engine diamond-fact) (flow diamond-fact)
-                          (view in-tz) out-tz)))))
+        (dnnl-transformer (dnnl-engine diamond-fact) (flow diamond-fact) (view in-tz) out-tz)))))
 
 (defn dnnl-tensor
   ([diamond-fact neand-fact eng mem-desc n-index]
@@ -559,6 +594,3 @@
 (prefer-method transfer! [DnnlTensor Object] [Object DnnlTensor])
 (prefer-method transfer! [DnnlTensor DnnlTensor] [Object DnnlTensor])
 (prefer-method transfer! [DnnlTensor DnnlTensor] [DnnlTensor Object])
-
-(defn dnnl-args [args-fn & args]
-  (apply args-fn (map (fmap #(if % (buffer %) %)) args)))

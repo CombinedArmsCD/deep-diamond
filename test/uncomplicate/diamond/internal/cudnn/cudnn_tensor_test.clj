@@ -6,7 +6,8 @@
 ;;   the terms of this license.
 ;;   You must not remove this notice, or any other, from this software.
 
-(ns uncomplicate.diamond.internal.cudnn.cudnn-tensor-test
+(ns ^{:author "Dragan Djuric"}
+    uncomplicate.diamond.internal.cudnn.cudnn-tensor-test
   (:require [midje.sweet :refer [facts throws =>]]
             [uncomplicate.commons.core :refer [with-release]]
             [uncomplicate.neanderthal.core :refer [dim asum native transfer!]]
@@ -57,5 +58,6 @@
     (test-push-different *diamond-factory*)
     (test-push-same *diamond-factory*)
     (test-batcher *diamond-factory*)
+    (test-batcher-tnc *diamond-factory*)
     (test-shuffler *diamond-factory*)
     (test-cudnn-transfer dnnl-fact *diamond-factory*)))
